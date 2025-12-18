@@ -1,0 +1,96 @@
+# STM32CubeIDE / Eclipse
+.metadata/
+.settings/
+.cproject
+.project
+*.launch
+
+# Build directories
+Debug/
+Release/
+build/
+
+# Object files
+*.o
+*.obj
+*.elf
+*.bin
+*.hex
+*.map
+*.lst
+*.su
+*.d
+*.cyclo
+
+# Linker output
+*.ilk
+*.exp
+
+# Precompiled Headers
+*.gch
+*.pch
+
+# Libraries
+*.lib
+*.a
+*.la
+*.lo
+
+# Shared objects (inc. Windows DLLs)
+*.dll
+*.so
+*.so.*
+*.dylib
+
+# Executables
+*.exe
+*.out
+*.app
+*.i*86
+*.x86_64
+
+# Debug files
+*.dSYM/
+*.su
+*.idb
+*.pdb
+
+# Arduino
+*.ino.cpp
+*.ino.with_bootloader.bin
+*.ino.with_bootloader.hex
+*.ino.map
+
+# ESP8266
+*.bin
+*.elf
+*.map
+
+# OS specific
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# Temporary files
+*.bak
+*.tmp
+*.temp
+*.log
+
+# User-specific files (keep these commented if you want to version them)
+# *.ioc
+# STM32F407VGTX_FLASH.ld
+# STM32F407VGTX_RAM.ld
+
+# Credentials (IMPORTANT: Never commit these!)
+*password*
+*credentials*
+secrets.h
+config_private.h
+
+# Generated files
+*.autosave
