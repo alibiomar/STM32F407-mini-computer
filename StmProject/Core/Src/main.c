@@ -1210,7 +1210,7 @@ void HandleUpButton(void) {
             switch(displayMode) {
                 case DISPLAY_MODE_HOME:
                     // Navigate right (next item)
-                    carouselPosition = (carouselPosition + 1) % DESKTOP_ITEM_COUNT;
+                    carouselPosition = (carouselPosition -1 + DESKTOP_ITEM_COUNT) % DESKTOP_ITEM_COUNT;
                     selectedDesktopItem = carouselPosition;
                     displayNeedsUpdate = true;
                     break;
@@ -1268,7 +1268,7 @@ void HandleDownButton(void) {
             switch(displayMode) {
                 case DISPLAY_MODE_HOME:
                     // Navigate left (previous item)
-                    carouselPosition = (carouselPosition - 1 + DESKTOP_ITEM_COUNT) % DESKTOP_ITEM_COUNT;
+                    carouselPosition = (carouselPosition + 1) % DESKTOP_ITEM_COUNT;
                     selectedDesktopItem = carouselPosition;
                     displayNeedsUpdate = true;
                     break;
