@@ -152,63 +152,59 @@ Power On
 HAL_Init() → Clock Config → Peripheral Init
    ↓
 FreeRTOS Task Creation
-   ↓
-   ├─► ESP8266 WiFi Connection
-   ├─► OLED Display Init (SH1106)
-   ├─► USB Host Init (Keyboard)
-   └─► Resource Creation (Queues, Semaphores, Mutexes)
-   ↓
+ **Input**: USB HID Keyboard + 4 Push Buttons
 Main Loop (Scheduler Running)
 ```
-
-### 2. Display Mode State Machine
-```
-                    ┌──────────────┐
-                    │  HOME SCREEN │
-                    └──────┬───────┘
+ **FreeRTOS Multitasking**: Multiple concurrent tasks with priority management
                            │
         ┌──────────────────┼──────────────────┐
         ↓                  ↓                  ↓
    [TEXT MODE]        [CALCULATOR]       [GAME MODE]
         │                  │                  │
         ↓                  ↓                  ↓
-   Email Setup       Operations         Snake/Pong/Tetris
-        │                  │                  │
-        ↓                  ↓                  ↓
-   Send to ESP       Calculate          Game Loop
-        │                  │                  │
-        ↓                  ↓                  ↓
-   Status Screen     Display Result     Score/Game Over
-```
 
+│  Task Name        │ Priority │ Stack (words) │ Purpose        │
+├───────────────────┼──────────┼───────┼───────────┤
+│ defaultTask       │ Normal   │ 128   │ CMSIS-OS hook  │
+│ MainLoopTask      │ 2        │ 1024  │ UI + input      │
+│ UARTReceiveTask   │ 1        │ 512   │ ESP RX parsing  │
+│ DisplayTask       │ 2        │ 512   │ OLED refresh    │
+│ GameUpdateTask    │ 2        │ 512   │ Game tick loop  │
 ### 3. Email Sending Flow
 ```
 User Types on USB Keyboard
    ↓
-KeyboardTask: Character Capture
-   ↓
-AddCharToBuffer() → TextBuffer (max 2000 chars)
-   ↓
+KEY:<c>                     - Send a single typed character (email/text input)
+SEND_EMAIL:<recipient>      - Send collected text via SMTP
+WIFI_SSID:<ssid>            - Stage WiFi SSID
+WIFI_PASS:<password>        - Stage WiFi password (can be empty)
+WIFI_CONNECT                - Apply staged WiFi credentials
+GET_IP                      - Request current IP address
+CLEAR_TEXT                  - Clear collected text buffer on ESP
+GET_TEXT_LEN                - Query collected text length
 DisplayTask: Update OLED (8 lines × 21 chars)
    ↓
 User Presses Confirm Button
    ↓
-SendEmailCommand()
    ↓
 Format: "EMAIL:<recipient>:<text>"
+DISPLAY_UPDATE_TEXT         - Request STM32 to refresh text view
+EMAIL:<message>             - Email progress/status messages (includes success/fail)
    ↓
 UART → ESP8266
    ↓
 ESP8266: SMTP Connection (smtp.gmail.com:465)
-   ↓
-Gmail Account Authentication
+│  PC1 ───────────────────► Exit Button
+│  PC2 ───────────────────► Confirm/OK Button
+│  PC3 ───────────────────► Up/Previous Button
+│  PC4 ───────────────────► Down/Next Button
    ↓
 Email Transmission
    ↓
 Status → STM32 → OLED Display
    ↓
 Success/Failure Notification
-```
+Format: "SEND_EMAIL:<recipient>"
 
 ### 4. Game Loop (Snake Example)
 ```
