@@ -3,8 +3,11 @@
   ******************************************************************************
   * @file           : main.c
   * @brief          : STM32F407E-DISCO with OLED Display and HID Keyboard
-  *                   PC1 = Switch/Navigate button
-  *                   PC2 = Confirm/OK button (FIXED from PC0)
+  *                   Button Configuration (4-button control):
+  *                   PC1 = Exit button (returns to home/exits screens)
+  *                   PC2 = Confirm/OK button (selects/confirms actions)
+  *                   PC3 = Up/Previous button (navigates backward)
+  *                   PC4 = Down/Next/Exit button (exits screens/games)
   ******************************************************************************
   */
 /* USER CODE END Header */
@@ -20,6 +23,11 @@
 #include "stdbool.h"
 #include "usbh_hid.h"
 #include "usbh_hid_keybd.h"
+#include "game.h"
+#include "fonts.h"
+#include "SH1106.h"
+#include "bitmap.h"
+#include "bootAnim.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -29,15 +37,7 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-#define LED_GREEN_PIN    GPIO_PIN_12
-#define LED_ORANGE_PIN   GPIO_PIN_13
-#define LED_RED_PIN      GPIO_PIN_14
-#define LED_BLUE_PIN     GPIO_PIN_15
-#define LED_PORT         GPIOD
-
-#define BUTTON_CONFIRM_PIN   GPIO_PIN_2  // PC2 - Confirm/OK button (FIXED)
-#define BUTTON_SWITCH_PIN    GPIO_PIN_1  // PC1 - Switch/Navigate button
-#define BUTTON_PORT          GPIOC
+// Button and LED definitions moved to main.h
 
 #define MAX_TEXT_LENGTH 2000
 #define DISPLAY_LINES 8
@@ -60,22 +60,22 @@ UART_HandleTypeDef huart6;
 
 osThreadId defaultTaskHandle;
 /* USER CODE BEGIN PV */
-QueueHandle_t espQueue;
-SemaphoreHandle_t uartMutexHandle;
-SemaphoreHandle_t displayMutexHandle;
-SemaphoreHandle_t i2cMutexHandle;  // NEW: Separate mutex for I2C hardware access
-SemaphoreHandle_t buttonSemaphore;
+// Simplified - only essential mutexes
+SemaphoreHandle_t dataMutexHandle;      // Protects all shared data
+SemaphoreHandle_t displayUpdateFlag;     // Signals display needs update
 
-TaskHandle_t espSendTaskHandle;
-TaskHandle_t espRecvTaskHandle;
-TaskHandle_t keyboardTaskHandle;
-TaskHandle_t displayTaskHandle;
+TaskHandle_t mainLoopTaskHandle;
+TaskHandle_t uartTaskHandle;
 
 // Button variables
-GPIO_PinState lastSwitchState = GPIO_PIN_SET;
+GPIO_PinState lastExitState = GPIO_PIN_SET;
 GPIO_PinState lastConfirmState = GPIO_PIN_SET;
-uint32_t lastSwitchDebounceTime = 0;
+GPIO_PinState lastUpState = GPIO_PIN_SET;
+GPIO_PinState lastDownState = GPIO_PIN_SET;
+uint32_t lastExitDebounceTime = 0;
 uint32_t lastConfirmDebounceTime = 0;
+uint32_t lastUpDebounceTime = 0;
+uint32_t lastDownDebounceTime = 0;
 #define DEBOUNCE_DELAY 50
 
 
@@ -98,6 +98,9 @@ typedef struct {
 
 EmailInfo_t emailInfo = {0};
 
+char ipEsp[20] = {0};
+bool displayNeedsUpdate = false;
+
 #define DESKTOP_ITEM_COUNT 5
 uint8_t selectedDesktopItem = 0;
 
@@ -116,7 +119,6 @@ extern USBH_HandleTypeDef hUsbHostFS;
 HID_KEYBD_Info_TypeDef *keyboardInfo;
 uint8_t lastKeyState[6] = {0};
 bool keyboardConnected = false;
-char ipEsp[20] = {0};
 
 // Display mode
 typedef enum {
@@ -189,14 +191,12 @@ static void MX_I2C1_Init(void);
 void StartDefaultTask(void const * argument);
 
 /* USER CODE BEGIN PFP */
-void ESP_SendTask(void *argument);
-void ESP_ReceiveTask(void *argument);
-void KeyboardTask(void *argument);
-void GameUpdateTask(void *argument);
-void DisplayTask(void *argument);
-void ButtonTask(void *argument);
-bool ProcessLEDCommand(char* buffer, char* ledState);
+void MainLoopTask(void *argument);
+void UARTReceiveTask(void *argument);
 void Initialize_Resources(void);
+void ProcessKeyboard(void);
+void ProcessButtons(void);
+void RequestDisplayUpdate(void);
 char ConvertHIDKeyToChar(uint8_t keyCode, bool shift);
 void UpdateDisplay(void);
 void DisplayHomeScreen(void);
@@ -207,7 +207,9 @@ void AddCharToBuffer(char c);
 void ClearTextBuffer(void);
 void DisplaySystemInfoScreen(void);
 void HandleConfirmButton(void);
-void HandleSwitchButton(void);
+void HandleExitButton(void);
+void HandleUpButton(void);
+void HandleDownButton(void);
 void SendEmailCommand(void);
 void SendCharToESP(char c);
 void DisplayCalculatorScreen(void);
@@ -218,6 +220,10 @@ void CalculatorExecute(void);
 void DisplaySettingsScreen(void);
 void HandleSettingsInput(char c);
 void SendWiFiConfigToESP(void);
+
+// FreeRTOS tasks (forward declarations)
+void DisplayTask(void *argument);
+void GameUpdateTask(void *argument);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -284,15 +290,11 @@ int main(void)
   defaultTaskHandle = osThreadCreate(osThread(defaultTask), NULL);
 
   /* USER CODE BEGIN RTOS_THREADS */
-  // Adjusted priorities to prevent conflicts
-  // Lower number = lower priority
-  xTaskCreate(ESP_SendTask, "espSendTask", 256, NULL, 1, &espSendTaskHandle);
-  xTaskCreate(KeyboardTask, "keyboardTask", 768, NULL, 2, &keyboardTaskHandle);
-  xTaskCreate(ESP_ReceiveTask, "espRecvTask", 768, NULL, 3, &espRecvTaskHandle);
-  xTaskCreate(DisplayTask, "displayTask", 768, NULL, 2, &displayTaskHandle);
-  xTaskCreate(ButtonTask, "buttonTask", 256, NULL, 4, NULL);  // Highest priority
-  xTaskCreate(GameUpdateTask, "gameUpdate", 256, NULL, 2, NULL);
-
+  // Create all necessary tasks
+  xTaskCreate(MainLoopTask, "mainLoop", 1024, NULL, 2, &mainLoopTaskHandle);
+  xTaskCreate(UARTReceiveTask, "uartRecv", 512, NULL, 1, &uartTaskHandle);
+  xTaskCreate(DisplayTask, "display", 512, NULL, 2, NULL);
+  xTaskCreate(GameUpdateTask, "gameUpdate", 512, NULL, 2, NULL);
   /* USER CODE END RTOS_THREADS */
 
   /* Start scheduler */
@@ -496,10 +498,10 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : PC1 PC2 PC3 */
-  GPIO_InitStruct.Pin = GPIO_PIN_1|GPIO_PIN_2|GPIO_PIN_3;
+  /*Configure GPIO pins : PC1 PC2 PC3 PC4 - All button inputs */
+  GPIO_InitStruct.Pin = GPIO_PIN_1|GPIO_PIN_2|GPIO_PIN_3|GPIO_PIN_4;
   GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;  // Enable pull-up resistors for buttons
   HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
 
   /*Configure GPIO pin : B1_Pin */
@@ -570,23 +572,209 @@ static void MX_GPIO_Init(void)
 /* USER CODE BEGIN 4 */
 
 void Initialize_Resources(void) {
-  uartMutexHandle = xSemaphoreCreateMutex();
-  if (uartMutexHandle == NULL) {
+  dataMutexHandle = xSemaphoreCreateMutex();
+  if (dataMutexHandle == NULL) {
     Error_Handler();
   }
 
-  displayMutexHandle = xSemaphoreCreateMutex();
-  if (displayMutexHandle == NULL) {
+  displayUpdateFlag = xSemaphoreCreateBinary();
+  if (displayUpdateFlag == NULL) {
     Error_Handler();
   }
 
-  i2cMutexHandle = xSemaphoreCreateMutex();
-  if (i2cMutexHandle == NULL) {
-    Error_Handler();
+  // *** ADD THIS ***
+  strcpy(ipEsp, "");
+  strcpy(emailInfo.status, "Ready");
+}
+
+// Request display update from any context
+void RequestDisplayUpdate(void) {
+  xSemaphoreGive(displayUpdateFlag);
+}
+
+// SIMPLIFIED: Single main loop task handles keyboard, buttons, and display
+void MainLoopTask(void *argument) {
+  vTaskDelay(pdMS_TO_TICKS(500));
+
+  for (;;) {
+    // 1. Process USB keyboard
+    ProcessKeyboard();
+
+    // 2. Process buttons
+    ProcessButtons();
+
+    // 3. Check if display needs update
+    if (xSemaphoreTake(displayUpdateFlag, 0) == pdTRUE) {
+      // IMPORTANT: Display rendering must be single-owner.
+      // DisplayTask handles all OLED updates (including game rendering).
+      // Calling UpdateDisplay() here can clear the screen while a game is rendering.
+      if (xSemaphoreTake(dataMutexHandle, pdMS_TO_TICKS(20)) == pdTRUE) {
+        displayNeedsUpdate = true;
+        xSemaphoreGive(dataMutexHandle);
+      } else {
+        // Best-effort: even without mutex, flagging an update is safe for a bool.
+        displayNeedsUpdate = true;
+      }
+    }
+
+    // 4. Give other tasks time
+    vTaskDelay(pdMS_TO_TICKS(20));
   }
-  Game_Init();
-  // Start UART interrupt reception
-  HAL_UART_Receive_IT(&huart6, &uartRxByte, 1);
+}
+
+void ProcessKeyboard(void) {
+  if (USBH_HID_GetDeviceType(&hUsbHostFS) != HID_KEYBOARD) {
+    if (keyboardConnected) {
+      if (xSemaphoreTake(dataMutexHandle, pdMS_TO_TICKS(50)) == pdTRUE) {
+        keyboardConnected = false;
+        memset(lastKeyState, 0, 6);
+        xSemaphoreGive(dataMutexHandle);
+      }
+    }
+    return;
+  }
+
+  keyboardInfo = USBH_HID_GetKeybdInfo(&hUsbHostFS);
+  if (keyboardInfo == NULL) return;
+
+  if (xSemaphoreTake(dataMutexHandle, pdMS_TO_TICKS(50)) != pdTRUE) {
+    return;
+  }
+
+  if (!keyboardConnected) {
+    keyboardConnected = true;
+    HAL_GPIO_WritePin(LED_PORT, LED_GREEN_PIN, GPIO_PIN_SET);
+    vTaskDelay(pdMS_TO_TICKS(100));
+    HAL_GPIO_WritePin(LED_PORT, LED_GREEN_PIN, GPIO_PIN_RESET);
+  }
+
+  bool currentShiftState = (keyboardInfo->lshift || keyboardInfo->rshift);
+
+  for (uint8_t i = 0; i < 6; i++) {
+    if (keyboardInfo->keys[i] != 0) {
+      bool keyFound = false;
+      for (uint8_t j = 0; j < 6; j++) {
+        if (keyboardInfo->keys[i] == lastKeyState[j]) {
+          keyFound = true;
+          break;
+        }
+      }
+
+      if (!keyFound) {
+        uint8_t keyCode = keyboardInfo->keys[i];
+        char c = 0;
+
+        if (keyCode == 0x28) {
+          c = '\n';
+        }
+        else if (keyCode == 0x2A) {
+          if (emailMode) {
+            if (emailIdx > 0) {
+              emailIdx--;
+              emailBuffer[emailIdx] = '\0';
+            }
+          } else {
+            if (textBuffer.length > 0) {
+              textBuffer.length--;
+              textBuffer.text[textBuffer.length] = '\0';
+            }
+          }
+          displayNeedsUpdate = true;
+          HAL_GPIO_TogglePin(LED_PORT, LED_RED_PIN);
+          xSemaphoreGive(dataMutexHandle);
+          RequestDisplayUpdate();
+          memcpy(lastKeyState, keyboardInfo->keys, 6);
+          return;
+        }
+        else if (keyCode == 0x2C) {
+          c = ' ';
+        }
+        else {
+          c = ConvertHIDKeyToChar(keyCode, currentShiftState);
+        }
+
+        if (c != 0) {
+          if (emailMode) {
+            if (emailIdx < 63) {
+              emailBuffer[emailIdx++] = c;
+            }
+          } else {
+            if (textBuffer.length < MAX_TEXT_LENGTH - 1) {
+              textBuffer.text[textBuffer.length++] = c;
+              textBuffer.text[textBuffer.length] = '\0';
+            }
+
+            char keyMsg[15];
+            snprintf(keyMsg, sizeof(keyMsg), "KEY:%c\n", c);
+            HAL_UART_Transmit(&huart6, (uint8_t*)keyMsg, strlen(keyMsg), 100);
+          }
+
+          displayNeedsUpdate = true;
+          HAL_GPIO_TogglePin(LED_PORT, LED_BLUE_PIN);
+        }
+      }
+    }
+  }
+
+  memcpy(lastKeyState, keyboardInfo->keys, 6);
+  xSemaphoreGive(dataMutexHandle);
+
+  if (displayNeedsUpdate) {
+    RequestDisplayUpdate();
+  }
+}
+
+void ProcessButtons(void) {
+  GPIO_PinState currentExitState = HAL_GPIO_ReadPin(BUTTON_PORT, BUTTON_EXIT_PIN);
+  GPIO_PinState currentConfirmState = HAL_GPIO_ReadPin(BUTTON_PORT, BUTTON_CONFIRM_PIN);
+  GPIO_PinState currentUpState = HAL_GPIO_ReadPin(BUTTON_PORT, BUTTON_UP_PIN);
+  GPIO_PinState currentDownState = HAL_GPIO_ReadPin(BUTTON_PORT, BUTTON_DOWN_PIN);
+  uint32_t currentTime = HAL_GetTick();
+
+  if (currentExitState == GPIO_PIN_RESET && lastExitState == GPIO_PIN_SET) {
+    if ((currentTime - lastExitDebounceTime) > DEBOUNCE_DELAY) {
+      lastExitDebounceTime = currentTime;
+      HAL_GPIO_WritePin(LED_PORT, LED_ORANGE_PIN, GPIO_PIN_SET);
+      HandleExitButton();
+      vTaskDelay(pdMS_TO_TICKS(50));
+      HAL_GPIO_WritePin(LED_PORT, LED_ORANGE_PIN, GPIO_PIN_RESET);
+    }
+  }
+
+  if (currentConfirmState == GPIO_PIN_RESET && lastConfirmState == GPIO_PIN_SET) {
+    if ((currentTime - lastConfirmDebounceTime) > DEBOUNCE_DELAY) {
+      lastConfirmDebounceTime = currentTime;
+      HAL_GPIO_WritePin(LED_PORT, LED_BLUE_PIN, GPIO_PIN_SET);
+      HandleConfirmButton();
+      vTaskDelay(pdMS_TO_TICKS(50));
+      HAL_GPIO_WritePin(LED_PORT, LED_BLUE_PIN, GPIO_PIN_RESET);
+    }
+  }
+
+  if (currentUpState == GPIO_PIN_RESET && lastUpState == GPIO_PIN_SET) {
+    if ((currentTime - lastUpDebounceTime) > DEBOUNCE_DELAY) {
+      lastUpDebounceTime = currentTime;
+      HAL_GPIO_WritePin(LED_PORT, LED_GREEN_PIN, GPIO_PIN_SET);
+      HandleUpButton();
+      vTaskDelay(pdMS_TO_TICKS(50));
+      HAL_GPIO_WritePin(LED_PORT, LED_GREEN_PIN, GPIO_PIN_RESET);
+    }
+  }
+
+  if (currentDownState == GPIO_PIN_RESET && lastDownState == GPIO_PIN_SET) {
+    if ((currentTime - lastDownDebounceTime) > DEBOUNCE_DELAY) {
+      lastDownDebounceTime = currentTime;
+      HAL_GPIO_WritePin(LED_PORT, LED_RED_PIN, GPIO_PIN_SET);
+      HandleDownButton();
+      vTaskDelay(pdMS_TO_TICKS(50));
+      HAL_GPIO_WritePin(LED_PORT, LED_RED_PIN, GPIO_PIN_RESET);
+    }
+  }
+
+  lastExitState = currentExitState;
+  lastConfirmState = currentConfirmState;
+  lastUpState = currentUpState;
+  lastDownState = currentDownState;
 }
 
 /* ============================================================================
@@ -633,7 +821,7 @@ bool UART_ReadByte(uint8_t *byte) {
 }
 
 void CalculatorClear(void) {
-    if (xSemaphoreTake(displayMutexHandle, pdMS_TO_TICKS(100)) == pdTRUE) {
+    if (xSemaphoreTake(dataMutexHandle, pdMS_TO_TICKS(100)) == pdTRUE) {
         strcpy(calcDisplay, "0");
         memset(calcBuffer, 0, sizeof(calcBuffer));
         lastOperator = 0;
@@ -641,12 +829,12 @@ void CalculatorClear(void) {
         newNumber = true;
         errorState = false;
         textBuffer.needsUpdate = true;
-        xSemaphoreGive(displayMutexHandle);
+        xSemaphoreGive(dataMutexHandle);
     }
 }
 
 void CalculatorBackspace(void) {
-    if (xSemaphoreTake(displayMutexHandle, pdMS_TO_TICKS(100)) == pdTRUE) {
+    if (xSemaphoreTake(dataMutexHandle, pdMS_TO_TICKS(100)) == pdTRUE) {
         uint8_t len = strlen(calcDisplay);
         if (len > 1 && !errorState) {
             calcDisplay[len - 1] = '\0';
@@ -654,14 +842,14 @@ void CalculatorBackspace(void) {
             strcpy(calcDisplay, "0");
         }
         textBuffer.needsUpdate = true;
-        xSemaphoreGive(displayMutexHandle);
+        xSemaphoreGive(dataMutexHandle);
     }
 }
 
 void CalculatorExecute(void) {
-    if (xSemaphoreTake(displayMutexHandle, pdMS_TO_TICKS(100)) == pdTRUE) {
+    if (xSemaphoreTake(dataMutexHandle, pdMS_TO_TICKS(100)) == pdTRUE) {
         if (errorState) {
-            xSemaphoreGive(displayMutexHandle);
+            xSemaphoreGive(dataMutexHandle);
             return;
         }
 
@@ -680,7 +868,7 @@ void CalculatorExecute(void) {
                         strcpy(calcDisplay, "Error");
                         errorState = true;
                         textBuffer.needsUpdate = true;
-                        xSemaphoreGive(displayMutexHandle);
+                        xSemaphoreGive(dataMutexHandle);
                         return;
                     }
                     break;
@@ -709,14 +897,14 @@ void CalculatorExecute(void) {
         lastValue = 0.0;
         newNumber = true;
         textBuffer.needsUpdate = true;
-        xSemaphoreGive(displayMutexHandle);
+        xSemaphoreGive(dataMutexHandle);
     }
 }
 
 void HandleCalculatorInput(char c) {
-    if (xSemaphoreTake(displayMutexHandle, pdMS_TO_TICKS(100)) == pdTRUE) {
+    if (xSemaphoreTake(dataMutexHandle, pdMS_TO_TICKS(100)) == pdTRUE) {
         if (errorState && c != 'C' && c != 'c') {
-            xSemaphoreGive(displayMutexHandle);
+            xSemaphoreGive(dataMutexHandle);
             return;
         }
 
@@ -729,7 +917,7 @@ void HandleCalculatorInput(char c) {
             newNumber = true;
             errorState = false;
             textBuffer.needsUpdate = true;
-            xSemaphoreGive(displayMutexHandle);
+            xSemaphoreGive(dataMutexHandle);
             return;
         }
 
@@ -774,7 +962,7 @@ void HandleCalculatorInput(char c) {
                             strcpy(calcDisplay, "Error");
                             errorState = true;
                             textBuffer.needsUpdate = true;
-                            xSemaphoreGive(displayMutexHandle);
+                            xSemaphoreGive(dataMutexHandle);
                             return;
                         }
                         break;
@@ -791,7 +979,7 @@ void HandleCalculatorInput(char c) {
             textBuffer.needsUpdate = true;
         }
 
-        xSemaphoreGive(displayMutexHandle);
+        xSemaphoreGive(dataMutexHandle);
     }
 }
 
@@ -804,32 +992,38 @@ void GameUpdateTask(void *argument) {
   }
 }
 void ButtonTask(void *argument) {
-  GPIO_PinState currentSwitchState;
+  GPIO_PinState currentExitState;
   GPIO_PinState currentConfirmState;
+  GPIO_PinState currentUpState;
+  GPIO_PinState currentDownState;
 
   // Initial state reading
-  lastSwitchState = HAL_GPIO_ReadPin(BUTTON_PORT, BUTTON_SWITCH_PIN);
+  lastExitState = HAL_GPIO_ReadPin(BUTTON_PORT, BUTTON_EXIT_PIN);
   lastConfirmState = HAL_GPIO_ReadPin(BUTTON_PORT, BUTTON_CONFIRM_PIN);
+  lastUpState = HAL_GPIO_ReadPin(BUTTON_PORT, BUTTON_UP_PIN);
+  lastDownState = HAL_GPIO_ReadPin(BUTTON_PORT, BUTTON_DOWN_PIN);
 
   vTaskDelay(pdMS_TO_TICKS(100)); // Initial stabilization delay
 
   for(;;) {
     // Read button states
-    currentSwitchState = HAL_GPIO_ReadPin(BUTTON_PORT, BUTTON_SWITCH_PIN);
+    currentExitState = HAL_GPIO_ReadPin(BUTTON_PORT, BUTTON_EXIT_PIN);
     currentConfirmState = HAL_GPIO_ReadPin(BUTTON_PORT, BUTTON_CONFIRM_PIN);
+    currentUpState = HAL_GPIO_ReadPin(BUTTON_PORT, BUTTON_UP_PIN);
+    currentDownState = HAL_GPIO_ReadPin(BUTTON_PORT, BUTTON_DOWN_PIN);
 
-    // Handle Switch Button (PC1) - Navigate through screens
+    // Handle Exit Button (PC1) - Return to home/exit screens
     // Button pressed: HIGH to LOW transition (pull-up resistor)
-    if (currentSwitchState == GPIO_PIN_RESET && lastSwitchState == GPIO_PIN_SET) {
+    if (currentExitState == GPIO_PIN_RESET && lastExitState == GPIO_PIN_SET) {
       uint32_t currentTime = HAL_GetTick();
-      if ((currentTime - lastSwitchDebounceTime) > DEBOUNCE_DELAY) {
-        lastSwitchDebounceTime = currentTime;
+      if ((currentTime - lastExitDebounceTime) > DEBOUNCE_DELAY) {
+        lastExitDebounceTime = currentTime;
 
         // Visual feedback - turn ON LED
         HAL_GPIO_WritePin(LED_PORT, LED_ORANGE_PIN, GPIO_PIN_SET);
 
         // Handle button action
-        HandleSwitchButton();
+        HandleExitButton();
 
         // Keep LED on briefly for visual feedback
         vTaskDelay(pdMS_TO_TICKS(100));
@@ -855,199 +1049,267 @@ void ButtonTask(void *argument) {
       }
     }
 
-    lastSwitchState = currentSwitchState;
+    // Handle Up Button (PC3) - Navigate Up/Previous
+    if (currentUpState == GPIO_PIN_RESET && lastUpState == GPIO_PIN_SET) {
+      uint32_t currentTime = HAL_GetTick();
+      if ((currentTime - lastUpDebounceTime) > DEBOUNCE_DELAY) {
+        lastUpDebounceTime = currentTime;
+
+        // Visual feedback - turn ON LED
+        HAL_GPIO_WritePin(LED_PORT, LED_GREEN_PIN, GPIO_PIN_SET);
+
+        // Handle button action
+        HandleUpButton();
+
+        // Keep LED on briefly for visual feedback
+        vTaskDelay(pdMS_TO_TICKS(100));
+        HAL_GPIO_WritePin(LED_PORT, LED_GREEN_PIN, GPIO_PIN_RESET);
+      }
+    }
+
+    // Handle Down Button (PC4) - Navigate Down/Next/Exit
+    if (currentDownState == GPIO_PIN_RESET && lastDownState == GPIO_PIN_SET) {
+      uint32_t currentTime = HAL_GetTick();
+      if ((currentTime - lastDownDebounceTime) > DEBOUNCE_DELAY) {
+        lastDownDebounceTime = currentTime;
+
+        // Visual feedback - turn ON LED
+        HAL_GPIO_WritePin(LED_PORT, LED_RED_PIN, GPIO_PIN_SET);
+
+        // Handle button action
+        HandleDownButton();
+
+        // Keep LED on briefly for visual feedback
+        vTaskDelay(pdMS_TO_TICKS(100));
+        HAL_GPIO_WritePin(LED_PORT, LED_RED_PIN, GPIO_PIN_RESET);
+      }
+    }
+
+    lastExitState = currentExitState;
     lastConfirmState = currentConfirmState;
+    lastUpState = currentUpState;
+    lastDownState = currentDownState;
     vTaskDelay(pdMS_TO_TICKS(10));
   }
 }
 
-void HandleSwitchButton(void) {
-    if (xSemaphoreTake(displayMutexHandle, pdMS_TO_TICKS(100)) == pdTRUE) {
+void HandleExitButton(void) {
+    if (xSemaphoreTake(dataMutexHandle, pdMS_TO_TICKS(100)) == pdTRUE) {
         if (gameMode) {
-            // In game mode - pass input to game system
-            Game_HandleInput(1); // 1 = Switch button
+            // In game mode - Exit button
+            Game_HandleInput(1); // 1 = Exit button
         } else {
-            // Normal mode handling
-            switch(displayMode) {
-                case DISPLAY_MODE_HOME:
-                    // Cycle carousel right
-                    carouselPosition = (carouselPosition + 1) % DESKTOP_ITEM_COUNT;
-                    selectedDesktopItem = carouselPosition;
-                    textBuffer.needsUpdate = true;
-                    break;
-
-                case DISPLAY_MODE_GAME:
-                    // If in game menu but not in game mode, exit completely
-                    displayMode = DISPLAY_MODE_HOME;
-                    textBuffer.needsUpdate = true;
-                    break;
-                case DISPLAY_MODE_SETTINGS:  // UPDATED - Exit to home
-                               displayMode = DISPLAY_MODE_HOME;
-                               // Clear settings data
-                               wifiSettings.editingSSID = true;
-                               wifiSettings.ssidIdx = 0;
-                               wifiSettings.passwordIdx = 0;
-                               memset(wifiSettings.ssid, 0, sizeof(wifiSettings.ssid));
-                               memset(wifiSettings.password, 0, sizeof(wifiSettings.password));
-                               memset(wifiSettings.status, 0, sizeof(wifiSettings.status));
-                               textBuffer.needsUpdate = true;
-                               break;
-
-                case DISPLAY_MODE_SYSTEM_INFO:
-                case DISPLAY_MODE_TEXT:
-                case DISPLAY_MODE_EMAIL_SETUP:
-                case DISPLAY_MODE_EMAIL_STATUS:
-                case DISPLAY_MODE_CALCULATOR:
-                    // Return to home
-                    displayMode = DISPLAY_MODE_HOME;
-                    emailMode = false;
-                    emailIdx = 0;
-                    memset(emailBuffer, 0, sizeof(emailBuffer));
-                    textBuffer.needsUpdate = true;
-                    break;
-                default:
-                    displayMode = DISPLAY_MODE_HOME;
-                    break;
+            // Exit button - return to home from any screen
+            if (displayMode != DISPLAY_MODE_HOME) {
+                displayMode = DISPLAY_MODE_HOME;
+                emailMode = false;
+                emailIdx = 0;
+                memset(emailBuffer, 0, sizeof(emailBuffer));
+                displayNeedsUpdate = true;
             }
         }
-        xSemaphoreGive(displayMutexHandle);
+        xSemaphoreGive(dataMutexHandle);
+        RequestDisplayUpdate();
     }
 }
 
 void HandleConfirmButton(void) {
-    DisplayMode_t currentMode;
-    bool currentGameMode;
-    bool needsClear = false;
-    bool sendEmail = false;
-    bool sendIPRequest = false;
-    bool sendWiFiConfig = false;
-    char emailRecipient[64] = {0};
-
-    if (xSemaphoreTake(displayMutexHandle, pdMS_TO_TICKS(100)) == pdTRUE) {
-        currentMode = displayMode;
-        currentGameMode = gameMode;
-        xSemaphoreGive(displayMutexHandle);
-    } else {
+    if (xSemaphoreTake(dataMutexHandle, pdMS_TO_TICKS(100)) != pdTRUE) {
         return;
     }
 
-    if (currentGameMode) {
-        Game_HandleInput(2); // 2 = Confirm button
-        return;
-    }
+    DisplayMode_t currentMode = displayMode;
 
-    if (xSemaphoreTake(displayMutexHandle, pdMS_TO_TICKS(100)) == pdTRUE) {
-        switch(currentMode) {
-            case DISPLAY_MODE_HOME:
-                displayMode = desktopItems[selectedDesktopItem].targetMode;
+    switch(currentMode) {
+        case DISPLAY_MODE_HOME:
+            // Select the current carousel item
+            if (carouselPosition >= 0 && carouselPosition < DESKTOP_ITEM_COUNT) {
+                displayMode = desktopItems[carouselPosition].targetMode;
                 if (displayMode == DISPLAY_MODE_TEXT) {
                     emailMode = false;
-                    emailInfo.textConfirmed = false;
-                    emailInfo.hasRecipient = false;
-                    needsClear = true;
-                } else if (displayMode == DISPLAY_MODE_EMAIL_SETUP) {
-                    emailMode = true;
-                    emailIdx = 0;
-                    memset(emailBuffer, 0, sizeof(emailBuffer));
+                    memset(textBuffer.text, 0, sizeof(textBuffer.text));
+                    textBuffer.length = 0;
                 } else if (displayMode == DISPLAY_MODE_GAME) {
-                    gameMode = true;
-                    currentGame.state = GAME_STATE_MENU;
-                } else if (displayMode == DISPLAY_MODE_SETTINGS) {
-                    wifiSettings.editingSSID = true;
-                    wifiSettings.ssidIdx = 0;
-                    wifiSettings.passwordIdx = 0;
-                    memset(wifiSettings.ssid, 0, sizeof(wifiSettings.ssid));
-                    memset(wifiSettings.password, 0, sizeof(wifiSettings.password));
-                    memset(wifiSettings.status, 0, sizeof(wifiSettings.status));
+                    Game_Init();
+                    // Don't set gameMode = true here! Let Game_Start() do it when user selects a game
+                    textBuffer.needsUpdate = true; // Ensure display updates
                 }
-                textBuffer.needsUpdate = true;
-                break;
+                displayNeedsUpdate = true;
+            }
+            break;
 
-            case DISPLAY_MODE_GAME:
-                gameMode = true;
-                currentGame.state = GAME_STATE_MENU;
-                textBuffer.needsUpdate = true;
-                break;
+        case DISPLAY_MODE_TEXT:
+            if (textBuffer.length > 0) {
+                displayMode = DISPLAY_MODE_EMAIL_SETUP;
+                emailMode = true;
+                emailIdx = 0;
+                memset(emailBuffer, 0, sizeof(emailBuffer));
+                displayNeedsUpdate = true;
+            }
+            break;
 
-            case DISPLAY_MODE_TEXT:
-                if (textBuffer.length > 0) {
-                    emailInfo.textConfirmed = true;
-                    displayMode = DISPLAY_MODE_EMAIL_SETUP;
-                    emailMode = true;
-                    emailIdx = 0;
-                    memset(emailBuffer, 0, sizeof(emailBuffer));
-                    textBuffer.needsUpdate = true;
-                }
-                break;
+        case DISPLAY_MODE_EMAIL_SETUP:
+            if (emailIdx > 0) {
+                emailBuffer[emailIdx < 63 ? emailIdx : 63] = '\0';
+                strncpy(emailInfo.recipient, emailBuffer, 63);
+                emailInfo.recipient[63] = '\0';
+                emailMode = false;
+                strcpy(emailInfo.status, "Sending...");
+                displayMode = DISPLAY_MODE_EMAIL_STATUS;
+                displayNeedsUpdate = true;
+                xSemaphoreGive(dataMutexHandle);
+                RequestDisplayUpdate();
+                vTaskDelay(pdMS_TO_TICKS(50));
+                SendEmailCommand();
+                return;
+            }
+            break;
 
-            case DISPLAY_MODE_EMAIL_SETUP:
-                if (emailIdx > 0) {
-                    uint8_t copyLen = (emailIdx < 63) ? emailIdx : 63;
-                    emailBuffer[copyLen] = '\0';
-                    strncpy(emailInfo.recipient, emailBuffer, 63);
-                    emailInfo.recipient[63] = '\0';
-                    emailInfo.hasRecipient = true;
-                    emailMode = false;
-                    strncpy(emailRecipient, emailInfo.recipient, 63);
-                    emailRecipient[63] = '\0';
-                    sendEmail = true;
-                    strcpy(emailInfo.status, "Sending...");
-                    displayMode = DISPLAY_MODE_EMAIL_STATUS;
-                    textBuffer.needsUpdate = true;
-                }
-                break;
+        case DISPLAY_MODE_SYSTEM_INFO:
+            xSemaphoreGive(dataMutexHandle);
+            const char* refreshMsg = "TEST:REQUEST_IP\n";
+            HAL_UART_Transmit(&huart6, (uint8_t*)refreshMsg, strlen(refreshMsg), 100);
+            HAL_GPIO_TogglePin(LED_PORT, LED_GREEN_PIN);
+            return;
 
-            case DISPLAY_MODE_EMAIL_STATUS:
-                HAL_GPIO_WritePin(LED_PORT, LED_GREEN_PIN | LED_ORANGE_PIN | LED_RED_PIN, GPIO_PIN_RESET);
-                displayMode = DISPLAY_MODE_HOME;
-                emailInfo.textConfirmed = false;
-                emailInfo.hasRecipient = false;
-                memset(emailInfo.status, 0, sizeof(emailInfo.status));
-                memset(emailInfo.recipient, 0, sizeof(emailInfo.recipient));
-                textBuffer.needsUpdate = true;
-                needsClear = true;
-                break;
-
-            case DISPLAY_MODE_SETTINGS:
-            	if (wifiSettings.ssidIdx > 0 ) {
-            	                    strcpy(wifiSettings.status, "Updating...");
-            	                    sendWiFiConfig = true;
-            	                    textBuffer.needsUpdate = true;
-            	                }
-                break;
-
-            case DISPLAY_MODE_SYSTEM_INFO:
-                sendIPRequest = true;
-                break;
-        }
-
-        if (needsClear) {
+        case DISPLAY_MODE_EMAIL_STATUS:
+            displayMode = DISPLAY_MODE_HOME;
             memset(textBuffer.text, 0, sizeof(textBuffer.text));
             textBuffer.length = 0;
-            textBuffer.needsUpdate = true;
-        }
-        xSemaphoreGive(displayMutexHandle);
-    }
-
-    if (sendIPRequest) {
-        if (xSemaphoreTake(uartMutexHandle, pdMS_TO_TICKS(100)) == pdTRUE) {
-            const char* refreshMsg = "TEST:REQUEST_IP\n";
-            HAL_UART_Transmit(&huart6, (uint8_t*)refreshMsg, strlen(refreshMsg), 1000);
-            xSemaphoreGive(uartMutexHandle);
-            HAL_GPIO_WritePin(LED_PORT, LED_GREEN_PIN, GPIO_PIN_SET);
-            vTaskDelay(pdMS_TO_TICKS(100));
+            displayNeedsUpdate = true;
             HAL_GPIO_WritePin(LED_PORT, LED_GREEN_PIN, GPIO_PIN_RESET);
+            HAL_GPIO_WritePin(LED_PORT, LED_RED_PIN, GPIO_PIN_RESET);
+            break;
+            
+        case DISPLAY_MODE_CALCULATOR:
+            // Calculator-specific action (could be equals, evaluate, etc.)
+            // For now, do nothing - let PC3 clear and PC4 exit
+            break;
+
+        case DISPLAY_MODE_SETTINGS:
+            // Settings-specific action if needed
+            break;
+
+        case DISPLAY_MODE_GAME:
+            // Game handles its own input (both menu and gameplay)
+            Game_HandleInput(2);
+            break;
+    }
+
+    xSemaphoreGive(dataMutexHandle);
+    RequestDisplayUpdate();
+}
+
+void HandleUpButton(void) {
+    if (xSemaphoreTake(dataMutexHandle, pdMS_TO_TICKS(100)) == pdTRUE) {
+        if (displayMode == DISPLAY_MODE_GAME) {
+      // In game display mode - Up button for game control (menu & gameplay)
+      Game_HandleInput(3); // 3 = Up button
+        } else {
+            // Right button - Navigate right or perform secondary actions
+            switch(displayMode) {
+                case DISPLAY_MODE_HOME:
+                    // Navigate right (next item)
+                    carouselPosition = (carouselPosition + 1) % DESKTOP_ITEM_COUNT;
+                    selectedDesktopItem = carouselPosition;
+                    displayNeedsUpdate = true;
+                    break;
+
+                case DISPLAY_MODE_TEXT:
+                    // Clear text buffer
+                    memset(textBuffer.text, 0, sizeof(textBuffer.text));
+                    textBuffer.length = 0;
+                    displayNeedsUpdate = true;
+                    break;
+
+                case DISPLAY_MODE_EMAIL_SETUP:
+                    // Clear email buffer
+                    memset(emailBuffer, 0, sizeof(emailBuffer));
+                    emailIdx = 0;
+                    displayNeedsUpdate = true;
+                    break;
+
+                case DISPLAY_MODE_CALCULATOR:
+                    // Clear calculator
+                    CalculatorClear();
+                    displayNeedsUpdate = true;
+                    break;
+
+                case DISPLAY_MODE_SYSTEM_INFO:
+                    // Refresh system info
+                    xSemaphoreGive(dataMutexHandle);
+                    const char* refreshMsg = "TEST:REQUEST_IP\n";
+                    HAL_UART_Transmit(&huart6, (uint8_t*)refreshMsg, strlen(refreshMsg), 100);
+                    HAL_GPIO_TogglePin(LED_PORT, LED_GREEN_PIN);
+                    return;
+
+                case DISPLAY_MODE_EMAIL_STATUS:
+                case DISPLAY_MODE_SETTINGS:
+                case DISPLAY_MODE_GAME:
+                    // No secondary action needed
+                    break;
+                    
+                default:
+                    break;
+            }
         }
+        xSemaphoreGive(dataMutexHandle);
+        RequestDisplayUpdate();
     }
+}
 
-    if (sendEmail) {
-        vTaskDelay(pdMS_TO_TICKS(50));
-        SendEmailCommand();
-    }
+void HandleDownButton(void) {
+    if (xSemaphoreTake(dataMutexHandle, pdMS_TO_TICKS(100)) == pdTRUE) {
+        if (displayMode == DISPLAY_MODE_GAME) {
+      // In game mode - Down button for game control
+      Game_HandleInput(4); // 4 = Down button
+        } else {
+            // Left button - Navigate left or backspace
+            switch(displayMode) {
+                case DISPLAY_MODE_HOME:
+                    // Navigate left (previous item)
+                    carouselPosition = (carouselPosition - 1 + DESKTOP_ITEM_COUNT) % DESKTOP_ITEM_COUNT;
+                    selectedDesktopItem = carouselPosition;
+                    displayNeedsUpdate = true;
+                    break;
 
-    if (sendWiFiConfig) {
-        vTaskDelay(pdMS_TO_TICKS(50));
-        SendWiFiConfigToESP();
+                case DISPLAY_MODE_TEXT:
+                    // Backspace - remove last character from text buffer
+                    if (textBuffer.length > 0) {
+                        textBuffer.length--;
+                        textBuffer.text[textBuffer.length] = '\0';
+                        displayNeedsUpdate = true;
+                    }
+                    break;
+
+                case DISPLAY_MODE_EMAIL_SETUP:
+                    // Backspace - remove last character from email
+                    if (emailIdx > 0) {
+                        emailIdx--;
+                        emailBuffer[emailIdx] = '\0';
+                        displayNeedsUpdate = true;
+                    }
+                    break;
+
+                case DISPLAY_MODE_CALCULATOR:
+                    // Backspace in calculator
+                    CalculatorBackspace();
+                    displayNeedsUpdate = true;
+                    break;
+
+                case DISPLAY_MODE_SYSTEM_INFO:
+                case DISPLAY_MODE_SETTINGS:
+                case DISPLAY_MODE_EMAIL_STATUS:
+                case DISPLAY_MODE_GAME:
+                    // No action - use PC1 to exit
+                    break;
+                    
+                default:
+                    break;
+            }
+        }
+        xSemaphoreGive(dataMutexHandle);
+        RequestDisplayUpdate();
     }
 }
 
@@ -1065,7 +1327,7 @@ void DisplaySettingsScreen(void) {
     bool editingSSID;
     uint8_t ssidLen, passLen;
 
-    if (xSemaphoreTake(displayMutexHandle, pdMS_TO_TICKS(50)) == pdTRUE) {
+    if (xSemaphoreTake(dataMutexHandle, pdMS_TO_TICKS(50)) == pdTRUE) {
         strncpy(localSSID, wifiSettings.ssid, MAX_SSID_LENGTH);
         localSSID[MAX_SSID_LENGTH] = '\0';
         strncpy(localPassword, wifiSettings.password, MAX_PASSWORD_LENGTH);
@@ -1075,7 +1337,7 @@ void DisplaySettingsScreen(void) {
         editingSSID = wifiSettings.editingSSID;
         ssidLen = wifiSettings.ssidIdx;
         passLen = wifiSettings.passwordIdx;
-        xSemaphoreGive(displayMutexHandle);
+        xSemaphoreGive(dataMutexHandle);
     } else {
         strcpy(localSSID, "");
         strcpy(localPassword, "");
@@ -1147,7 +1409,7 @@ void DisplaySettingsScreen(void) {
 
 // NEW: Handle Settings Input
 void HandleSettingsInput(char c) {
-    if (xSemaphoreTake(displayMutexHandle, pdMS_TO_TICKS(100)) == pdTRUE) {
+    if (xSemaphoreTake(dataMutexHandle, pdMS_TO_TICKS(100)) == pdTRUE) {
         if (wifiSettings.editingSSID) {
             // Editing SSID
             if (wifiSettings.ssidIdx < MAX_SSID_LENGTH) {
@@ -1163,7 +1425,7 @@ void HandleSettingsInput(char c) {
                 textBuffer.needsUpdate = true;
             }
         }
-        xSemaphoreGive(displayMutexHandle);
+        xSemaphoreGive(dataMutexHandle);
     }
 }
 
@@ -1174,27 +1436,27 @@ void SendWiFiConfigToESP(void) {
 
     // Send SSID
     cmdLen = snprintf(wifiCmd, sizeof(wifiCmd), "WIFI_SSID:%s\n", wifiSettings.ssid);
-    if (xSemaphoreTake(uartMutexHandle, pdMS_TO_TICKS(100)) == pdTRUE) {
+    if (xSemaphoreTake(dataMutexHandle, pdMS_TO_TICKS(100)) == pdTRUE) {
         HAL_UART_Transmit(&huart6, (uint8_t*)wifiCmd, cmdLen, 1000);
-        xSemaphoreGive(uartMutexHandle);
+        xSemaphoreGive(dataMutexHandle);
     }
 
     vTaskDelay(pdMS_TO_TICKS(100));
 
     // Send Password
     cmdLen = snprintf(wifiCmd, sizeof(wifiCmd), "WIFI_PASS:%s\n", wifiSettings.password);
-    if (xSemaphoreTake(uartMutexHandle, pdMS_TO_TICKS(100)) == pdTRUE) {
+    if (xSemaphoreTake(dataMutexHandle, pdMS_TO_TICKS(100)) == pdTRUE) {
         HAL_UART_Transmit(&huart6, (uint8_t*)wifiCmd, cmdLen, 1000);
-        xSemaphoreGive(uartMutexHandle);
+        xSemaphoreGive(dataMutexHandle);
     }
 
     vTaskDelay(pdMS_TO_TICKS(100));
 
     // Send connect command
     const char* connectCmd = "WIFI_CONNECT\n";
-    if (xSemaphoreTake(uartMutexHandle, pdMS_TO_TICKS(100)) == pdTRUE) {
+    if (xSemaphoreTake(dataMutexHandle, pdMS_TO_TICKS(100)) == pdTRUE) {
         HAL_UART_Transmit(&huart6, (uint8_t*)connectCmd, strlen(connectCmd), 1000);
-        xSemaphoreGive(uartMutexHandle);
+        xSemaphoreGive(dataMutexHandle);
     }
 
     HAL_GPIO_WritePin(LED_PORT, LED_ORANGE_PIN, GPIO_PIN_SET);
@@ -1215,12 +1477,13 @@ void DisplayTask(void *argument) {
     bool currentGameMode;
 
     // Check if update is needed
-    if (xSemaphoreTake(displayMutexHandle, pdMS_TO_TICKS(50)) == pdTRUE) {
-      updateNeeded = textBuffer.needsUpdate;
+    if (xSemaphoreTake(dataMutexHandle, pdMS_TO_TICKS(50)) == pdTRUE) {
+      updateNeeded = displayNeedsUpdate || textBuffer.needsUpdate;
+      displayNeedsUpdate = false;
       textBuffer.needsUpdate = false;
       currentMode = displayMode;
       currentGameMode = gameMode;  // Get current game mode state
-      xSemaphoreGive(displayMutexHandle);
+      xSemaphoreGive(dataMutexHandle);
     } else {
       // Couldn't get mutex, try again next cycle
       vTaskDelay(pdMS_TO_TICKS(100));
@@ -1232,19 +1495,21 @@ void DisplayTask(void *argument) {
     // 2. Game mode state changed (entered or exited game)
     // 3. Normal display update is needed
     // 4. In game mode, always update for smooth animation
-    if (currentMode != lastMode || currentGameMode != lastGameMode || updateNeeded || currentGameMode) {
+    // 5. In DISPLAY_MODE_GAME (menu or playing), always update
+    if (currentMode != lastMode || currentGameMode != lastGameMode || updateNeeded || currentGameMode || currentMode == DISPLAY_MODE_GAME) {
       updateNeeded = true;
       lastMode = currentMode;
       lastGameMode = currentGameMode;
     }
 
     if (updateNeeded) {
-      if (currentGameMode) {
-        // Game mode - use separate rendering path
-        if (xSemaphoreTake(i2cMutexHandle, pdMS_TO_TICKS(200)) == pdTRUE) {
+      if (currentGameMode || currentMode == DISPLAY_MODE_GAME) {
+        // Game mode (playing) or game display mode (menu) - use separate rendering path
+        if (xSemaphoreTake(dataMutexHandle, pdMS_TO_TICKS(200)) == pdTRUE) {
+          // Game_Render() handles screen clearing internally
           Game_Render();
           SH1106_UpdateScreen();
-          xSemaphoreGive(i2cMutexHandle);
+          xSemaphoreGive(dataMutexHandle);
         }
       } else {
         // Normal display mode
@@ -1258,58 +1523,157 @@ void DisplayTask(void *argument) {
   }
 }
 void UpdateDisplay(void) {
-  // Take mutex only to read display mode
-  DisplayMode_t currentMode;
-  bool currentGameMode;
-
-  if (xSemaphoreTake(displayMutexHandle, pdMS_TO_TICKS(100)) == pdTRUE) {
-    currentMode = displayMode;
-    currentGameMode = gameMode;
-    xSemaphoreGive(displayMutexHandle);
-  } else {
-    return;  // Failed to get mutex, skip this update
-  }
-
-  // If in game mode, let DisplayTask handle rendering
-  if (currentGameMode) {
+  if (xSemaphoreTake(dataMutexHandle, pdMS_TO_TICKS(100)) != pdTRUE) {
     return;
   }
 
-  // Now do the actual display update with I2C mutex protection
-  if (xSemaphoreTake(i2cMutexHandle, pdMS_TO_TICKS(200)) == pdTRUE) {
-    SH1106_Clear();
+  DisplayMode_t currentMode = displayMode;
+  displayNeedsUpdate = false;
+  xSemaphoreGive(dataMutexHandle);
 
-    switch(currentMode) {
-      case DISPLAY_MODE_HOME:
-        DisplayHomeScreen();
-        break;
-      case DISPLAY_MODE_TEXT:
-        DisplayTextScreen();
-        break;
-      case DISPLAY_MODE_EMAIL_SETUP:
-        DisplayEmailSetupScreen();
-        break;
-      case DISPLAY_MODE_EMAIL_STATUS:
-        DisplayEmailStatusScreen();
-        break;
-      case DISPLAY_MODE_SYSTEM_INFO:
-        DisplaySystemInfoScreen();
-        break;
-      case DISPLAY_MODE_CALCULATOR:
-        DisplayCalculatorScreen();
-        break;
-      case DISPLAY_MODE_GAME:  // Add this case
+  // Now update display WITHOUT holding data mutex
+  SH1106_Clear();
+
+  switch(currentMode) {
+    case DISPLAY_MODE_HOME:
+      DisplayHomeScreen();
+      break;
+    case DISPLAY_MODE_TEXT:
+      DisplayTextScreen();
+      break;
+    case DISPLAY_MODE_EMAIL_SETUP:
+      DisplayEmailSetupScreen();
+      break;
+    case DISPLAY_MODE_EMAIL_STATUS:
+      DisplayEmailStatusScreen();
+      break;
+    case DISPLAY_MODE_SYSTEM_INFO:
+      DisplaySystemInfoScreen();
+      break;
+    case DISPLAY_MODE_CALCULATOR:
+      DisplayCalculatorScreen();
+      break;
+    case DISPLAY_MODE_GAME:
+      // Game rendering is handled by DisplayUpdateTask when gameMode is true
+      // This case is only reached if gameMode is false (shouldn't happen normally)
+      if (!gameMode) {
         Game_Menu_Render();
-        break;
-      case DISPLAY_MODE_SETTINGS:  // NEW
-              DisplaySettingsScreen();
-              break;
+      }
+      break;
+    case DISPLAY_MODE_SETTINGS:
+      DisplaySettingsScreen();
+      break;
+  }
+
+  SH1106_UpdateScreen();
+}
+
+void UARTReceiveTask(void *argument) {
+  char buffer[128];
+  uint8_t idx = 0;
+  uint8_t c;
+
+  memset(buffer, 0, sizeof(buffer));
+
+  for(;;) {
+    if (HAL_UART_Receive(&huart6, &c, 1, 10) == HAL_OK) {
+      if (c == '\r') continue;
+
+      if (c == '\n') {
+        if (idx > 0) {
+          buffer[idx] = '\0';
+
+          if (strncmp(buffer, "IP:", 3) == 0) {
+            char* ipStr = buffer + 3;
+            int ipLen = strlen(ipStr);
+
+            if (ipLen > 0 && ipLen < 19) {
+              if (xSemaphoreTake(dataMutexHandle, pdMS_TO_TICKS(200)) == pdTRUE) {
+                strncpy(ipEsp, ipStr, 19);
+                ipEsp[19] = '\0';
+
+                if (displayMode == DISPLAY_MODE_SYSTEM_INFO) {
+                  displayNeedsUpdate = true;
+                }
+
+                xSemaphoreGive(dataMutexHandle);
+                RequestDisplayUpdate();
+              }
+
+              HAL_GPIO_WritePin(LED_PORT, LED_GREEN_PIN, GPIO_PIN_SET);
+              vTaskDelay(pdMS_TO_TICKS(100));
+              HAL_GPIO_WritePin(LED_PORT, LED_GREEN_PIN, GPIO_PIN_RESET);
+            }
+          }
+
+          else if (strncmp(buffer, "EMAIL:", 6) == 0) {
+            char* statusStr = buffer + 6;
+            int statusLen = strlen(statusStr);
+
+            if (statusLen > 0 && statusLen < 31) {
+              if (xSemaphoreTake(dataMutexHandle, pdMS_TO_TICKS(200)) == pdTRUE) {
+                strncpy(emailInfo.status, statusStr, 31);
+                emailInfo.status[31] = '\0';
+
+                if (displayMode != DISPLAY_MODE_EMAIL_STATUS) {
+                  displayMode = DISPLAY_MODE_EMAIL_STATUS;
+                }
+                displayNeedsUpdate = true;
+
+                xSemaphoreGive(dataMutexHandle);
+
+                if (strstr(statusStr, "success") != NULL ||
+                    strstr(statusStr, "Sent") != NULL ||
+                    strstr(statusStr, "sent") != NULL) {
+                  HAL_GPIO_WritePin(LED_PORT, LED_GREEN_PIN, GPIO_PIN_SET);
+                  HAL_GPIO_WritePin(LED_PORT, LED_ORANGE_PIN, GPIO_PIN_RESET);
+                  HAL_GPIO_WritePin(LED_PORT, LED_RED_PIN, GPIO_PIN_RESET);
+                }
+                else if (strstr(statusStr, "fail") != NULL ||
+                         strstr(statusStr, "Error") != NULL ||
+                         strstr(statusStr, "failed") != NULL) {
+                  HAL_GPIO_WritePin(LED_PORT, LED_RED_PIN, GPIO_PIN_SET);
+                  HAL_GPIO_WritePin(LED_PORT, LED_ORANGE_PIN, GPIO_PIN_RESET);
+                  HAL_GPIO_WritePin(LED_PORT, LED_GREEN_PIN, GPIO_PIN_RESET);
+                }
+                else if (strstr(statusStr, "Sending") != NULL ||
+                         strstr(statusStr, "Preparing") != NULL ||
+                         strstr(statusStr, "Connecting") != NULL ||
+                         strstr(statusStr, "Authenticating") != NULL) {
+                  HAL_GPIO_WritePin(LED_PORT, LED_ORANGE_PIN, GPIO_PIN_SET);
+                  HAL_GPIO_WritePin(LED_PORT, LED_GREEN_PIN, GPIO_PIN_RESET);
+                  HAL_GPIO_WritePin(LED_PORT, LED_RED_PIN, GPIO_PIN_RESET);
+                }
+
+                RequestDisplayUpdate();
+              }
+            }
+          }
+
+          else if (strncmp(buffer, "ACK:", 4) == 0) {
+            HAL_GPIO_TogglePin(LED_PORT, LED_BLUE_PIN);
+          }
+
+          idx = 0;
+          memset(buffer, 0, sizeof(buffer));
+        }
+      }
+      else if (idx < sizeof(buffer) - 1) {
+        buffer[idx++] = c;
+      }
+      else {
+        idx = 0;
+        memset(buffer, 0, sizeof(buffer));
+        HAL_GPIO_WritePin(LED_PORT, LED_RED_PIN, GPIO_PIN_SET);
+        vTaskDelay(pdMS_TO_TICKS(50));
+        HAL_GPIO_WritePin(LED_PORT, LED_RED_PIN, GPIO_PIN_RESET);
+      }
     }
 
-    SH1106_UpdateScreen();
-    xSemaphoreGive(i2cMutexHandle);
+    vTaskDelay(pdMS_TO_TICKS(5));
   }
 }
+
 void DisplayHomeScreen(void) {
     SH1106_DrawBitmap(0, 0, bg, 128, 64, 1);
 
@@ -1333,18 +1697,18 @@ void DisplayHomeScreen(void) {
             x -= (iconWidth * (selectedScale - 1)) / 2;
             y -= 4;
 
-            DrawIconWithFrame(x, y, desktopItems[itemIndex].icon,1);
+            SH1106_DrawBitmap(x, y, desktopItems[itemIndex].icon, 16, 16, 1);
 
 
             // Label under icon
             uint8_t labelLen = strlen(desktopItems[itemIndex].name);
             uint8_t labelX = x + (iconWidth * selectedScale - labelLen * 7) / 2;
             SH1106_GotoXY(labelX, y + iconWidth * selectedScale + 4);
-            SH1106_Puts(desktopItems[itemIndex].name, &Font_7x10, 1);
+            SH1106_Puts((char*)desktopItems[itemIndex].name, &Font_7x10, 1);
 
         } else {
             // Non-selected icons
-            DrawIconWithFrame(x, y, desktopItems[itemIndex].icon,1);
+        	SH1106_DrawBitmap(x, y, desktopItems[itemIndex].icon, 16, 16, 1);
         }
     }
 }
@@ -1461,13 +1825,13 @@ void DisplayTextScreen(void) {
     char localText[MAX_TEXT_LENGTH];
     uint16_t localLength;
 
-    if (xSemaphoreTake(displayMutexHandle, pdMS_TO_TICKS(50)) == pdTRUE) {
+    if (xSemaphoreTake(dataMutexHandle, pdMS_TO_TICKS(50)) == pdTRUE) {
         localLength = textBuffer.length;
         if (localLength > 0) {
             memcpy(localText, textBuffer.text, localLength);
             localText[localLength] = '\0';
         }
-        xSemaphoreGive(displayMutexHandle);
+        xSemaphoreGive(dataMutexHandle);
     } else {
         localLength = 0;
     }
@@ -1538,12 +1902,12 @@ void DisplayCalculatorScreen(void) {
     char localOperator = 0;
     bool localError = false;
 
-    if (xSemaphoreTake(displayMutexHandle, pdMS_TO_TICKS(50)) == pdTRUE) {
+    if (xSemaphoreTake(dataMutexHandle, pdMS_TO_TICKS(50)) == pdTRUE) {
         strncpy(localDisplay, calcDisplay, 21);
         localDisplay[21] = '\0';
         localOperator = lastOperator;
         localError = errorState;
-        xSemaphoreGive(displayMutexHandle);
+        xSemaphoreGive(dataMutexHandle);
     } else {
         strcpy(localDisplay, "0");
     }
@@ -1702,13 +2066,13 @@ void DisplayEmailSetupScreen(void) {
     char localEmailBuffer[64];
     uint8_t localEmailIdx;
 
-    if (xSemaphoreTake(displayMutexHandle, pdMS_TO_TICKS(50)) == pdTRUE) {
+    if (xSemaphoreTake(dataMutexHandle, pdMS_TO_TICKS(50)) == pdTRUE) {
         localEmailIdx = emailIdx;
         if (localEmailIdx > 0) {
             memcpy(localEmailBuffer, emailBuffer, localEmailIdx);
             localEmailBuffer[localEmailIdx] = '\0';
         }
-        xSemaphoreGive(displayMutexHandle);
+        xSemaphoreGive(dataMutexHandle);
     } else {
         localEmailIdx = 0;
     }
@@ -1754,12 +2118,12 @@ void DisplayEmailStatusScreen(void) {
     char localStatus[32];
     char localRecipient[64];
 
-    if (xSemaphoreTake(displayMutexHandle, pdMS_TO_TICKS(50)) == pdTRUE) {
+    if (xSemaphoreTake(dataMutexHandle, pdMS_TO_TICKS(50)) == pdTRUE) {
         strncpy(localStatus, emailInfo.status, 31);
         localStatus[31] = '\0';
         strncpy(localRecipient, emailInfo.recipient, 63);
         localRecipient[63] = '\0';
-        xSemaphoreGive(displayMutexHandle);
+        xSemaphoreGive(dataMutexHandle);
     } else {
         strcpy(localStatus, "Error");
         strcpy(localRecipient, "Unknown");
@@ -1789,7 +2153,6 @@ void DisplayEmailStatusScreen(void) {
     else {
         // Sending spinner (animated)
         uint8_t frame = (HAL_GetTick() / 200) % 8;
-        uint8_t angle = frame * 45;
         // Simple rotating line animation
         SH1106_DrawCircle(64, iconY + 6, 8, 1);
 
@@ -1812,8 +2175,8 @@ void DisplayEmailStatusScreen(void) {
 
 void ESP_SendTask(void *argument) {
   for(;;) {
-    if (xSemaphoreTake(uartMutexHandle, portMAX_DELAY) == pdTRUE) {
-      xSemaphoreGive(uartMutexHandle);
+    if (xSemaphoreTake(dataMutexHandle, portMAX_DELAY) == pdTRUE) {
+      xSemaphoreGive(dataMutexHandle);
     }
     vTaskDelay(pdMS_TO_TICKS(2000));
   }
@@ -1859,7 +2222,7 @@ void ESP_ReceiveTask(void *argument) {
             int ipLen = strlen(ipStr);
 
             if (ipLen > 0 && ipLen < 19) {
-              if (xSemaphoreTake(uartMutexHandle, pdMS_TO_TICKS(200)) == pdTRUE) {
+              if (xSemaphoreTake(dataMutexHandle, pdMS_TO_TICKS(200)) == pdTRUE) {
                 strncpy(ipEsp, ipStr, 19);
                 ipEsp[19] = '\0';
 
@@ -1868,7 +2231,7 @@ void ESP_ReceiveTask(void *argument) {
                 displayMode = DISPLAY_MODE_SYSTEM_INFO;
                 textBuffer.needsUpdate = true;
 
-                xSemaphoreGive(uartMutexHandle);
+                xSemaphoreGive(dataMutexHandle);
               }
 
               vTaskDelay(pdMS_TO_TICKS(200));
@@ -1878,7 +2241,7 @@ void ESP_ReceiveTask(void *argument) {
           else if (strncmp(buffer, "WIFI:", 5) == 0) {
                       char* statusStr = buffer + 5;
 
-                      if (xSemaphoreTake(displayMutexHandle, pdMS_TO_TICKS(200)) == pdTRUE) {
+                      if (xSemaphoreTake(dataMutexHandle, pdMS_TO_TICKS(200)) == pdTRUE) {
                         strncpy(wifiSettings.status, statusStr, 31);
                         wifiSettings.status[31] = '\0';
 
@@ -1886,7 +2249,7 @@ void ESP_ReceiveTask(void *argument) {
                           textBuffer.needsUpdate = true;
                         }
 
-                        xSemaphoreGive(displayMutexHandle);
+                        xSemaphoreGive(dataMutexHandle);
 
                         // LED feedback
                         if (strstr(statusStr, "Connected") != NULL || strstr(statusStr, "Success") != NULL) {
@@ -1906,7 +2269,7 @@ void ESP_ReceiveTask(void *argument) {
             int statusLen = strlen(statusStr);
 
             if (statusLen > 0 && statusLen < 31) {
-              if (xSemaphoreTake(uartMutexHandle, pdMS_TO_TICKS(200)) == pdTRUE) {
+              if (xSemaphoreTake(dataMutexHandle, pdMS_TO_TICKS(200)) == pdTRUE) {
                 strncpy(emailInfo.status, statusStr, 31);
                 emailInfo.status[31] = '\0';
 
@@ -1915,7 +2278,7 @@ void ESP_ReceiveTask(void *argument) {
                 }
                 textBuffer.needsUpdate = true;
 
-                xSemaphoreGive(uartMutexHandle);
+                xSemaphoreGive(dataMutexHandle);
 
                 // Update LEDs based on status
                 if (strstr(statusStr, "success") != NULL ||
@@ -1977,32 +2340,14 @@ void ESP_ReceiveTask(void *argument) {
   }}
 void SendEmailCommand(void) {
   char emailCmd[128];
-  int cmdLen;
-
-  if (xSemaphoreTake(displayMutexHandle, pdMS_TO_TICKS(100)) == pdTRUE) {
-    strcpy(emailInfo.status, "Sending...");
-    displayMode = DISPLAY_MODE_EMAIL_STATUS;
-    xSemaphoreGive(displayMutexHandle);
-  }
-
-  vTaskDelay(pdMS_TO_TICKS(100));
-
-  cmdLen = snprintf(emailCmd, sizeof(emailCmd), "SEND_EMAIL:%s\n", emailInfo.recipient);
-
-  if (xSemaphoreTake(uartMutexHandle, pdMS_TO_TICKS(100)) == pdTRUE) {
-    HAL_UART_Transmit(&huart6, (uint8_t*)emailCmd, cmdLen, 1000);
-    xSemaphoreGive(uartMutexHandle);
-  }
-
-  HAL_GPIO_WritePin(LED_PORT, LED_GREEN_PIN, GPIO_PIN_SET);
-  vTaskDelay(pdMS_TO_TICKS(50));
-  HAL_GPIO_WritePin(LED_PORT, LED_GREEN_PIN, GPIO_PIN_RESET);
+  int cmdLen = snprintf(emailCmd, sizeof(emailCmd), "SEND_EMAIL:%s\n", emailInfo.recipient);
+  HAL_UART_Transmit(&huart6, (uint8_t*)emailCmd, cmdLen, 1000);
+  HAL_GPIO_TogglePin(LED_PORT, LED_GREEN_PIN);
 }
 
 void KeyboardTask(void *argument) {
   uint8_t i, j;
   bool keyFound;
-  static bool lastShiftState = false;
   for(;;) {
     if (USBH_HID_GetDeviceType(&hUsbHostFS) == HID_KEYBOARD) {
       if (!keyboardConnected) {
@@ -2031,11 +2376,11 @@ void KeyboardTask(void *argument) {
               bool isSettingsMode = false;
 
               // Check modes safely
-              if (xSemaphoreTake(displayMutexHandle, pdMS_TO_TICKS(10)) == pdTRUE) {
+              if (xSemaphoreTake(dataMutexHandle, pdMS_TO_TICKS(10)) == pdTRUE) {
                 isEmailMode = emailMode;
                 isCalcMode = (displayMode == DISPLAY_MODE_CALCULATOR);
                 isSettingsMode = (displayMode == DISPLAY_MODE_SETTINGS);
-                xSemaphoreGive(displayMutexHandle);
+                xSemaphoreGive(dataMutexHandle);
               }
 
               // Enter key handling
@@ -2044,18 +2389,18 @@ void KeyboardTask(void *argument) {
                   CalculatorExecute();
                 } else if (isEmailMode) {
                   c = '\n';
-                  if (xSemaphoreTake(displayMutexHandle, pdMS_TO_TICKS(100)) == pdTRUE) {
+                  if (xSemaphoreTake(dataMutexHandle, pdMS_TO_TICKS(100)) == pdTRUE) {
                     if (emailIdx < 63) {
                       emailBuffer[emailIdx++] = c;
                     }
                     textBuffer.needsUpdate = true;
-                    xSemaphoreGive(displayMutexHandle);
+                    xSemaphoreGive(dataMutexHandle);
                   }
                 } else if (isSettingsMode) {
-                  if (xSemaphoreTake(displayMutexHandle, pdMS_TO_TICKS(100)) == pdTRUE) {
+                  if (xSemaphoreTake(dataMutexHandle, pdMS_TO_TICKS(100)) == pdTRUE) {
                     wifiSettings.editingSSID = !wifiSettings.editingSSID;
                     textBuffer.needsUpdate = true;
-                    xSemaphoreGive(displayMutexHandle);
+                    xSemaphoreGive(dataMutexHandle);
                   }
                 } else {
                   c = '\n';
@@ -2068,16 +2413,16 @@ void KeyboardTask(void *argument) {
                 if (isCalcMode) {
                   CalculatorBackspace();
                 } else if (isEmailMode) {
-                  if (xSemaphoreTake(displayMutexHandle, pdMS_TO_TICKS(100)) == pdTRUE) {
+                  if (xSemaphoreTake(dataMutexHandle, pdMS_TO_TICKS(100)) == pdTRUE) {
                     if (emailIdx > 0) {
                       emailIdx--;
                       emailBuffer[emailIdx] = '\0';
                       textBuffer.needsUpdate = true;
                     }
-                    xSemaphoreGive(displayMutexHandle);
+                    xSemaphoreGive(dataMutexHandle);
                   }
                 } else if (isSettingsMode) {
-                  if (xSemaphoreTake(displayMutexHandle, pdMS_TO_TICKS(100)) == pdTRUE) {
+                  if (xSemaphoreTake(dataMutexHandle, pdMS_TO_TICKS(100)) == pdTRUE) {
                     if (wifiSettings.editingSSID && wifiSettings.ssidIdx > 0) {
                       wifiSettings.ssidIdx--;
                       wifiSettings.ssid[wifiSettings.ssidIdx] = '\0';
@@ -2087,15 +2432,15 @@ void KeyboardTask(void *argument) {
                       wifiSettings.password[wifiSettings.passwordIdx] = '\0';
                       textBuffer.needsUpdate = true;
                     }
-                    xSemaphoreGive(displayMutexHandle);
+                    xSemaphoreGive(dataMutexHandle);
                   }
                 } else {
                   if (textBuffer.length > 0) {
-                    if (xSemaphoreTake(displayMutexHandle, portMAX_DELAY) == pdTRUE) {
+                    if (xSemaphoreTake(dataMutexHandle, portMAX_DELAY) == pdTRUE) {
                       textBuffer.length--;
                       textBuffer.text[textBuffer.length] = '\0';
                       textBuffer.needsUpdate = true;
-                      xSemaphoreGive(displayMutexHandle);
+                      xSemaphoreGive(dataMutexHandle);
                     }
                   }
                 }
@@ -2107,12 +2452,12 @@ void KeyboardTask(void *argument) {
               else if (keyCode == 0x2C) {
                 c = ' ';
                 if (isEmailMode) {
-                  if (xSemaphoreTake(displayMutexHandle, pdMS_TO_TICKS(100)) == pdTRUE) {
+                  if (xSemaphoreTake(dataMutexHandle, pdMS_TO_TICKS(100)) == pdTRUE) {
                     if (emailIdx < 63) {
                       emailBuffer[emailIdx++] = c;
                       textBuffer.needsUpdate = true;
                     }
-                    xSemaphoreGive(displayMutexHandle);
+                    xSemaphoreGive(dataMutexHandle);
                   }
                 } else if (isSettingsMode) {
                   HandleSettingsInput(c);
@@ -2128,12 +2473,12 @@ void KeyboardTask(void *argument) {
                   if (isCalcMode) {
                     HandleCalculatorInput(c);
                   } else if (isEmailMode) {
-                    if (xSemaphoreTake(displayMutexHandle, pdMS_TO_TICKS(100)) == pdTRUE) {
+                    if (xSemaphoreTake(dataMutexHandle, pdMS_TO_TICKS(100)) == pdTRUE) {
                       if (emailIdx < 63) {
                         emailBuffer[emailIdx++] = c;
                         textBuffer.needsUpdate = true;
                       }
-                      xSemaphoreGive(displayMutexHandle);
+                      xSemaphoreGive(dataMutexHandle);
                     }
                   } else if (isSettingsMode) {
                     HandleSettingsInput(c);
@@ -2150,26 +2495,24 @@ void KeyboardTask(void *argument) {
           }
         }
         memcpy(lastKeyState, keyboardInfo->keys, 6);
-        lastShiftState = currentShiftState;
       }
     } else {
       if (keyboardConnected) {
         keyboardConnected = false;
         memset(lastKeyState, 0, 6);
-        lastShiftState = false;
       }
     }
     vTaskDelay(pdMS_TO_TICKS(10));
   }
 }
 void AddCharToBuffer(char c) {
-  if (xSemaphoreTake(displayMutexHandle, pdMS_TO_TICKS(200)) == pdTRUE) {
+  if (xSemaphoreTake(dataMutexHandle, pdMS_TO_TICKS(200)) == pdTRUE) {
     if (textBuffer.length < MAX_TEXT_LENGTH - 1) {
       textBuffer.text[textBuffer.length++] = c;
       textBuffer.text[textBuffer.length] = '\0';
       textBuffer.needsUpdate = true;
     }
-    xSemaphoreGive(displayMutexHandle);
+    xSemaphoreGive(dataMutexHandle);
   }
 }
 
@@ -2179,19 +2522,19 @@ void SendCharToESP(char c) {
 
   snprintf(keyMsg, sizeof(keyMsg), "KEY:%c\n", c);
 
-  if (xSemaphoreTake(uartMutexHandle, pdMS_TO_TICKS(100)) == pdTRUE) {
+  if (xSemaphoreTake(dataMutexHandle, pdMS_TO_TICKS(100)) == pdTRUE) {
     HAL_UART_Transmit(&huart6, (uint8_t*)keyMsg, strlen(keyMsg), HAL_MAX_DELAY);
-    xSemaphoreGive(uartMutexHandle);
+    xSemaphoreGive(dataMutexHandle);
   }
 }
 
 // Keep this function for external calls if needed
 void ClearTextBuffer(void) {
-  if (xSemaphoreTake(displayMutexHandle, pdMS_TO_TICKS(200)) == pdTRUE) {
+  if (xSemaphoreTake(dataMutexHandle, pdMS_TO_TICKS(200)) == pdTRUE) {
     memset(textBuffer.text, 0, sizeof(textBuffer.text));
     textBuffer.length = 0;
     textBuffer.needsUpdate = true;
-    xSemaphoreGive(displayMutexHandle);
+    xSemaphoreGive(dataMutexHandle);
   }
 }
 
@@ -2240,63 +2583,59 @@ char ConvertHIDKeyToChar(uint8_t keyCode, bool shift) {
 /* USER CODE END Header_StartDefaultTask */
 void StartDefaultTask(void const * argument)
 {
-  /* init code for USB_HOST */
   MX_USB_HOST_Init();
-  /* USER CODE BEGIN 5 */
-  /* Infinite loop */
-  for(;;)
-  {
-    osDelay(1);
+  SH1106_Init();
+
+  // Animated startup using boot animation frames
+  // Play the animation (124x68 pixels, centered on 128x64 display)
+  for(int i = 0; i < epd_bitmap_allArray_LEN; i++) {
+    SH1106_Fill(SH1106_COLOR_BLACK);
+    SH1106_DrawBitmap(2, -2, epd_bitmap_allArray[i], 124, 68, SH1106_COLOR_WHITE);
+    SH1106_UpdateScreen();
+    osDelay(50);  // 50ms delay per frame for smooth animation
   }
-  /* USER CODE END 5 */
+
+  osDelay(300);
+
+  SH1106_Fill(SH1106_COLOR_BLACK);
+  SH1106_GotoXY(38, 22);
+  SH1106_Puts("HELLO!", &Font_7x10, SH1106_COLOR_WHITE);
+  SH1106_DrawLine(10, 38, 118, 38, SH1106_COLOR_WHITE);
+  SH1106_UpdateScreen();
+  osDelay(400);
+
+  SH1106_GotoXY(20, 48);
+  SH1106_Puts("System Ready", &Font_7x10, SH1106_COLOR_WHITE);
+  SH1106_UpdateScreen();
+  osDelay(500);
+
+  SH1106_Clear();
+  DisplayHomeScreen();
+  SH1106_UpdateScreen();
+
+  for(;;) {
+    USBH_Process(&hUsbHostFS);
+    osDelay(200);
+  }
 }
 
-/**
-  * @brief  Period elapsed callback in non blocking mode
-  * @note   This function is called  when TIM1 interrupt took place, inside
-  * HAL_TIM_IRQHandler(). It makes a direct call to HAL_IncTick() to increment
-  * a global variable "uwTick" used as application time base.
-  * @param  htim : TIM handle
-  * @retval None
-  */
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
-  /* USER CODE BEGIN Callback 0 */
-
-  /* USER CODE END Callback 0 */
   if (htim->Instance == TIM1)
   {
     HAL_IncTick();
   }
-  /* USER CODE BEGIN Callback 1 */
-
-  /* USER CODE END Callback 1 */
 }
 
-/**
-  * @brief  This function is executed in case of error occurrence.
-  * @retval None
-  */
 void Error_Handler(void)
 {
-  /* USER CODE BEGIN Error_Handler_Debug */
   __disable_irq();
-  while (1)
-  {
-  }
-  /* USER CODE END Error_Handler_Debug */
+  while (1) { }
 }
+
 #ifdef USE_FULL_ASSERT
-/**
-  * @brief  Reports the name of the source file and the source line number
-  *         where the assert_param error has occurred.
-  * @param  file: pointer to the source file name
-  * @param  line: assert_param error line source number
-  * @retval None
-  */
 void assert_failed(uint8_t *file, uint32_t line)
 {
-  /* USER CODE BEGIN 6 */
-  /* USER CODE END 6 */
 }
-#endif /* USE_FULL_ASSERT */
+#endif
+

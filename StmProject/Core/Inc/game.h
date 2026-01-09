@@ -64,6 +64,40 @@ typedef struct {
     int8_t dy;
 } Ball_t;
 
+// Tetris game structures
+#define TETRIS_WIDTH 10
+#define TETRIS_HEIGHT 18
+#define TETRIS_BLOCK_SIZE 3
+
+typedef enum {
+    PIECE_I,
+    PIECE_O,
+    PIECE_T,
+    PIECE_S,
+    PIECE_Z,
+    PIECE_J,
+    PIECE_L,
+    PIECE_COUNT
+} TetrisPiece_t;
+
+typedef struct {
+    int8_t x;
+    int8_t y;
+    TetrisPiece_t type;
+    uint8_t rotation; // 0-3
+    bool active;
+} TetrisCurrentPiece_t;
+
+typedef struct {
+    uint8_t grid[TETRIS_HEIGHT][TETRIS_WIDTH];
+    TetrisCurrentPiece_t currentPiece;
+    TetrisCurrentPiece_t nextPiece;
+    uint16_t linesCleared;
+    uint32_t lastDropTime;
+    uint32_t dropDelay;
+    bool fastDrop;
+} TetrisGame_t;
+
 // Main game structure
 typedef struct {
     GameType_t currentGame;
@@ -81,6 +115,9 @@ typedef struct {
     Ball_t ball;
     uint8_t leftScore;
     uint8_t rightScore;
+
+    // Tetris game
+    TetrisGame_t tetris;
 
     // Timing
     uint32_t lastUpdateTime;
@@ -116,6 +153,13 @@ void Pong_Render(void);
 void Tetris_Init(void);
 void Tetris_Update(void);
 void Tetris_Render(void);
+bool Tetris_CheckCollision(int8_t offsetX, int8_t offsetY, uint8_t rotation);
+void Tetris_SpawnPiece(void);
+void Tetris_LockPiece(void);
+void Tetris_ClearLines(void);
+void Tetris_RotatePiece(void);
+void Tetris_MovePiece(int8_t dx);
+void Tetris_DropPiece(void);
 
 void Game_Menu_Render(void);
 void Game_Exit_Confirm_Render(void);

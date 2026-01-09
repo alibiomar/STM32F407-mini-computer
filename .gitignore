@@ -56,7 +56,7 @@ build/
 *.pdb
 
 # Arduino
-*.ino.cpp
+*.ino
 *.ino.with_bootloader.bin
 *.ino.with_bootloader.hex
 *.ino.map
@@ -94,3 +94,4 @@ config_private.h
 
 # Generated files
 *.autosave
+codeESP8266/codeESP8266.ino

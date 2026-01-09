@@ -72,6 +72,20 @@ void Error_Handler(void);
 
 /* USER CODE BEGIN Private defines */
 
+// Button Configuration - 4-button control system
+#define BUTTON_CONFIRM_PIN   GPIO_PIN_2  // PC2 - Confirm/OK button
+#define BUTTON_EXIT_PIN      GPIO_PIN_1  // PC1 - Exit button
+#define BUTTON_UP_PIN        GPIO_PIN_3  // PC3 - Up/Previous button
+#define BUTTON_DOWN_PIN      GPIO_PIN_4  // PC4 - Down/Next/Exit button
+#define BUTTON_PORT          GPIOC
+
+// LED Configuration for button feedback
+#define LED_GREEN_PIN    GPIO_PIN_12
+#define LED_ORANGE_PIN   GPIO_PIN_13
+#define LED_RED_PIN      GPIO_PIN_14
+#define LED_BLUE_PIN     GPIO_PIN_15
+#define LED_PORT         GPIOD
+
 /* USER CODE END Private defines */
 
 #ifdef __cplusplus
