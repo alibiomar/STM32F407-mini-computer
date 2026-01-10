@@ -26,8 +26,11 @@ A comprehensive embedded system combining **STM32F407 Discovery Board** with **E
 - **MCU**: STM32F407VGT6 (ARM Cortex-M4, 168MHz)
 - **Display**: SH1106 OLED (128x64 pixels, I2C)
 - **WiFi**: ESP8266 Board
-- **Input**: USB HID Keyboard + 2 Push Buttons
+- **Input**: USB HID Keyboard + 4 Push Buttons (Exit, Confirm, Up, Down)
 - **LEDs**: 4x GPIO-controlled LEDs (Green, Orange, Red, Blue)
+- **Sensors**: 
+  - HC-SR04 Ultrasonic Distance Sensor (2-400 cm range)
+  - Infrared Color Detection Sensor (Black/White detection)
 - **Communication**: UART, I2C, USB Host
 
 ### Software Stack
@@ -42,10 +45,11 @@ A comprehensive embedded system combining **STM32F407 Discovery Board** with **E
 ## ✨ Features
 
 ### 🖥️ Multi-Mode Desktop Interface
-- **Home Screen**: Carousel-style menu with 5 applications
+- **Home Screen**: Carousel-style menu with 6 applications
 - **Email Client**: Send emails via Gmail SMTP
 - **Calculator**: Full-featured calculator with basic operations
 - **Games**: 3 retro games (Snake, Pong, Tetris)
+- **Sensors**: Real-time distance and color detection monitoring
 - **Settings**: WiFi configuration interface
 - **System Info**: Real-time system monitoring
 
@@ -71,7 +75,21 @@ A comprehensive embedded system combining **STM32F407 Discovery Board** with **E
 - Auto-reconnection
 - IP address monitoring
 
-### 🔧 Advanced Features
+### � Sensor System
+- **Ultrasonic Distance Sensor (HC-SR04)**:
+  - Range: 2-400 cm with 0.01 cm precision
+  - Trigger pin: PE7, Echo pin: PE8
+  - Real-time distance measurement
+  - Update rate: 200ms
+- **Infrared Color Sensor**:
+  - Black/White surface detection
+  - Digital output: HIGH (white), LOW (black)
+  - Pin: PE8 (shared with ultrasound echo)
+- **Sensor Menu Navigation**: Select and switch between sensors
+- **Live Readings Display**: Real-time sensor data on OLED
+- **GPIO Conflict Management**: Sensors initialize only when selected
+
+### �🔧 Advanced Features
 - **FreeRTOS Multitasking**: 6+ concurrent tasks with priority management
 - **USB HID Support**: Full keyboard mapping (alphanumeric, symbols, modifiers)
 - **Thread-Safe Operations**: Mutexes and semaphores for resource protection
@@ -128,8 +146,12 @@ STM32F407 Discovery Board
 │  USART6 (PC6/PC7) ──────► ESP8266 (TX/RX)
 │  USART2 (PA2/PA3) ──────► Debug/Monitor
 │  USB OTG FS ────────────► USB Keyboard
-│  PC1 ───────────────────► Switch Button
-│  PC2 ───────────────────► Confirm Button
+│  PC1 ───────────────────► Exit Button
+│  PC2 ───────────────────► Confirm/OK Button
+│  PC3 ───────────────────► Up/Previous Button
+│  PC4 ───────────────────► Down/Next Button
+│  PE7 ───────────────────► Ultrasound Trigger
+│  PE8 ───────────────────► Ultrasound Echo / IR Sensor
 │  PD12-15 ───────────────► LEDs (G/O/R/B)
 └────────────────────────────────────┘
 
@@ -316,10 +338,23 @@ Display: "WiFi Connected!"
    - GND → GND
 
 3. Connect **Push Buttons**:
-   - Switch Button → PC1 (with pull-up)
+   - Exit Button → PC1 (with pull-up)
    - Confirm Button → PC2 (with pull-up)
+   - Up Button → PC3 (with pull-up)
+   - Down Button → PC4 (with pull-up)
 
-4. Connect **USB Keyboard** to USB OTG FS port
+4. Connect **Sensors**:
+   - **HC-SR04 Ultrasonic Sensor**:
+     - VCC → 5V
+     - GND → GND
+     - Trig → PE7
+     - Echo → PE8
+   - **Infrared Color Sensor**:
+     - VCC → 3.3V or 5V (check sensor specifications)
+     - GND → GND
+     - OUT → PE8 (shares pin with ultrasound echo)
+
+5. Connect **USB Keyboard** to USB OTG FS port
 
 ### Software Setup
 
@@ -356,8 +391,10 @@ String password = "YourWiFiPassword";
 ## 📖 Usage
 
 ### Navigation
-- **Switch Button (PC1)**: Navigate menu items, change direction in games
+- **Exit Button (PC1)**: Exit current mode, navigate back to menu
 - **Confirm Button (PC2)**: Select item, perform action
+- **Up Button (PC3)**: Navigate up, previous item
+- **Down Button (PC4)**: Navigate down, next item
 - **USB Keyboard**: Type text, calculator input
 
 ### Modes
@@ -378,9 +415,18 @@ String password = "YourWiFiPassword";
 #### Game Mode
 1. Select "Games" from home screen
 2. Choose game: Snake, Pong, or Tetris
-3. Use Switch button to control
+3. Use Up/Down buttons to control
 4. Confirm button to pause
 5. Navigate to exit confirmation
+
+#### Sensors Mode
+1. Select "Sensors" from home screen
+2. Choose sensor using Up/Down buttons:
+   - **Distance**: Ultrasonic distance measurement
+   - **Color**: Infrared black/white detection
+3. Press Confirm to start sensor reading
+4. View real-time sensor data on display
+5. Press Exit or Confirm to return to sensor menu
 
 #### Settings Mode
 1. Select "Settings" from home screen
@@ -399,11 +445,13 @@ ProjetSystemeTR/
 │   │   ├── Inc/                # Header files
 │   │   │   ├── main.h          # Main definitions
 │   │   │   ├── game.h          # Game structures
+│   │   │   ├── sensors.h       # Sensor definitions
 │   │   │   ├── SH1106.h        # OLED driver
 │   │   │   └── fonts.h         # Display fonts
 │   │   ├── Src/                # Source files
 │   │   │   ├── main.c          # Main program (2303 lines)
 │   │   │   ├── game.c          # Game logic (595 lines)
+│   │   │   ├── sensors.c       # Sensor implementation (294 lines)
 │   │   │   ├── SH1106.c        # OLED implementation
 │   │   │   ├── freertos.c      # RTOS configuration
 │   │   │   └── fonts.c         # Font data
@@ -423,6 +471,36 @@ ProjetSystemeTR/
 ---
 
 ## 🎯 Key Algorithms
+
+### Ultrasonic Distance Measurement
+```c
+// HC-SR04 measurement algorithm
+// 1. Send 10µs trigger pulse
+HAL_GPIO_WritePin(TRIG_PORT, TRIG_PIN, SET);
+delay_us(10);
+HAL_GPIO_WritePin(TRIG_PORT, TRIG_PIN, RESET);
+
+// 2. Measure echo pulse duration
+startTime = timer_start();
+while (ECHO_PIN == LOW); // Wait for echo start
+while (ECHO_PIN == HIGH); // Wait for echo end
+endTime = timer_stop();
+
+// 3. Calculate distance (speed of sound = 343 m/s)
+distance_cm = (duration_us * 0.0343) / 2;
+
+// 4. Validate range (2-400 cm)
+if (distance < 2 || distance > 400) return last_valid;
+```
+
+### Infrared Color Detection
+```c
+// Digital IR sensor reading
+// HIGH = White surface (high reflectivity)
+// LOW = Black surface (low reflectivity)
+GPIO_PinState state = HAL_GPIO_ReadPin(IR_PORT, IR_PIN);
+bool isWhite = (state == GPIO_PIN_SET);
+```
 
 ### Text Buffer Management
 - **Circular buffer** for UART RX with overflow protection
@@ -473,12 +551,17 @@ for (int i = 1; i < snake.length; i++) {
 | Email not sending | Verify Gmail App Password, check WiFi connection |
 | Game lag | Increase `gameSpeed` value in game.c |
 | WiFi connection fails | Check SSID/password, verify ESP8266 power supply |
+| Sensors not reading | Check PE7/PE8 connections, verify sensor power (5V for HC-SR04) |
+| Distance sensor timeout | Ensure no GPIO conflicts, check echo pin connection |
+| IR sensor always white/black | Verify sensor orientation, check detection distance (<5cm typical) |
 
 ---
 
 ## 📊 Performance Metrics
 - **Display Update Rate**: 60 FPS (I2C @ 400kHz)
 - **Game Tick Rate**: 5 FPS (200ms per update)
+- **Sensor Update Rate**: 5 Hz (200ms interval)
+- **Distance Sensor Accuracy**: ±0.3 cm
 - **UART Baudrate**: 115200 bps
 - **Keyboard Scan Rate**: 100ms
 - **Button Debounce**: 50ms
@@ -492,7 +575,8 @@ for (int i = 1; i < snake.length; i++) {
 - [ ] File system support (SD card)
 - [ ] More games (Space Invaders, Breakout)
 - [ ] Calendar and reminder system
-- [ ] Temperature sensor integration
+- [ ] Additional sensors (temperature, humidity, light)
+- [ ] Sensor data logging and graphing
 - [ ] Bluetooth support
 - [ ] Multi-language support
 
