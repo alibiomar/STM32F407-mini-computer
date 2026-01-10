@@ -24,6 +24,7 @@
 #include "usbh_hid.h"
 #include "usbh_hid_keybd.h"
 #include "game.h"
+#include "sensors.h"
 #include "fonts.h"
 #include "SH1106.h"
 #include "bitmap.h"
@@ -101,7 +102,7 @@ EmailInfo_t emailInfo = {0};
 char ipEsp[20] = {0};
 bool displayNeedsUpdate = false;
 
-#define DESKTOP_ITEM_COUNT 5
+#define DESKTOP_ITEM_COUNT 6
 uint8_t selectedDesktopItem = 0;
 
 // LED state tracking
@@ -129,6 +130,7 @@ typedef enum {
   DISPLAY_MODE_SYSTEM_INFO,
   DISPLAY_MODE_CALCULATOR,
   DISPLAY_MODE_GAME,
+  DISPLAY_MODE_SENSORS,
   DISPLAY_MODE_SETTINGS
 } DisplayMode_t;
 
@@ -144,6 +146,7 @@ DesktopItem_t desktopItems[] = {
     {"Email", icon_email, DISPLAY_MODE_TEXT},
 	{"Calc", icon_calculator, DISPLAY_MODE_CALCULATOR},
 	 {"Games", icon_game, DISPLAY_MODE_GAME},
+	 {"Sensors", icon_sensors, DISPLAY_MODE_SENSORS},
 	 {"Settings", icon_system, DISPLAY_MODE_SETTINGS},
 	    {"System", icon_system, DISPLAY_MODE_SYSTEM_INFO},
 
@@ -151,6 +154,9 @@ DesktopItem_t desktopItems[] = {
 static int8_t carouselPosition = 0;
 // Email mode for keyboard input
 static bool emailMode = false;
+// When true, incoming EMAIL: UART messages may force the Email Status screen.
+// Cleared when user exits so Exit works reliably.
+static bool emailStatusAutoOpen = false;
 static char emailBuffer[64];
 static uint8_t emailIdx = 0;
 
@@ -290,7 +296,6 @@ int main(void)
   defaultTaskHandle = osThreadCreate(osThread(defaultTask), NULL);
 
   /* USER CODE BEGIN RTOS_THREADS */
-  // Create all necessary tasks
   xTaskCreate(MainLoopTask, "mainLoop", 1024, NULL, 2, &mainLoopTaskHandle);
   xTaskCreate(UARTReceiveTask, "uartRecv", 512, NULL, 1, &uartTaskHandle);
   xTaskCreate(DisplayTask, "display", 512, NULL, 2, NULL);
@@ -479,8 +484,8 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOC_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
   __HAL_RCC_GPIOB_CLK_ENABLE();
-  __HAL_RCC_GPIOD_CLK_ENABLE();
   __HAL_RCC_GPIOE_CLK_ENABLE();
+  __HAL_RCC_GPIOD_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOC, GPIO_PIN_0, GPIO_PIN_RESET);
@@ -498,10 +503,10 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : PC1 PC2 PC3 PC4 - All button inputs */
-  GPIO_InitStruct.Pin = GPIO_PIN_1|GPIO_PIN_2|GPIO_PIN_3|GPIO_PIN_4;
+  /*Configure GPIO pins : PC1 PC2 PC3 */
+  GPIO_InitStruct.Pin = GPIO_PIN_1|GPIO_PIN_2|GPIO_PIN_3;
   GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-  GPIO_InitStruct.Pull = GPIO_PULLUP;  // Enable pull-up resistors for buttons
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
 
   /*Configure GPIO pin : B1_Pin */
@@ -521,6 +526,12 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+  /*Configure GPIO pins : PE7 PE8 */
+  GPIO_InitStruct.Pin = GPIO_PIN_7|GPIO_PIN_8;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(GPIOE, &GPIO_InitStruct);
 
   /*Configure GPIO pins : LD4_Pin PD13 LD5_Pin LD6_Pin */
   GPIO_InitStruct.Pin = LD4_Pin|GPIO_PIN_13|LD5_Pin|LD6_Pin;
@@ -1026,7 +1037,7 @@ void ButtonTask(void *argument) {
         HandleExitButton();
 
         // Keep LED on briefly for visual feedback
-        vTaskDelay(pdMS_TO_TICKS(100));
+        vTaskDelay(pdMS_TO_TICKS(30));
         HAL_GPIO_WritePin(LED_PORT, LED_ORANGE_PIN, GPIO_PIN_RESET);
       }
     }
@@ -1044,7 +1055,7 @@ void ButtonTask(void *argument) {
         HandleConfirmButton();
 
         // Keep LED on briefly for visual feedback
-        vTaskDelay(pdMS_TO_TICKS(100));
+        vTaskDelay(pdMS_TO_TICKS(30));
         HAL_GPIO_WritePin(LED_PORT, LED_BLUE_PIN, GPIO_PIN_RESET);
       }
     }
@@ -1062,7 +1073,7 @@ void ButtonTask(void *argument) {
         HandleUpButton();
 
         // Keep LED on briefly for visual feedback
-        vTaskDelay(pdMS_TO_TICKS(100));
+        vTaskDelay(pdMS_TO_TICKS(30));
         HAL_GPIO_WritePin(LED_PORT, LED_GREEN_PIN, GPIO_PIN_RESET);
       }
     }
@@ -1080,7 +1091,7 @@ void ButtonTask(void *argument) {
         HandleDownButton();
 
         // Keep LED on briefly for visual feedback
-        vTaskDelay(pdMS_TO_TICKS(100));
+        vTaskDelay(pdMS_TO_TICKS(30));
         HAL_GPIO_WritePin(LED_PORT, LED_RED_PIN, GPIO_PIN_RESET);
       }
     }
@@ -1095,11 +1106,18 @@ void ButtonTask(void *argument) {
 
 void HandleExitButton(void) {
     if (xSemaphoreTake(dataMutexHandle, pdMS_TO_TICKS(100)) == pdTRUE) {
-        if (gameMode) {
-            // In game mode - Exit button
-            Game_HandleInput(1); // 1 = Exit button
+        if (sensorMode || displayMode == DISPLAY_MODE_SENSORS) {
+          // Sensor app: exit back to home in one press
+          Sensors_HandleInput(1); // 1 = Exit button
+          sensorMode = false;
+          displayMode = DISPLAY_MODE_HOME;
+          displayNeedsUpdate = true;
+        } else if (gameMode) {
+          // In game mode - Exit button
+          Game_HandleInput(1); // 1 = Exit button
         } else {
             // Exit button - return to home from any screen
+      emailStatusAutoOpen = false;
             if (displayMode != DISPLAY_MODE_HOME) {
                 displayMode = DISPLAY_MODE_HOME;
                 emailMode = false;
@@ -1119,6 +1137,15 @@ void HandleConfirmButton(void) {
     }
 
     DisplayMode_t currentMode = displayMode;
+
+    // Handle sensor mode input separately
+    if (sensorMode || currentMode == DISPLAY_MODE_SENSORS) {
+      Sensors_HandleInput(2); // 2 = Confirm button
+      displayNeedsUpdate = true;
+      xSemaphoreGive(dataMutexHandle);
+      RequestDisplayUpdate();
+      return;
+    }
 
     switch(currentMode) {
         case DISPLAY_MODE_HOME:
@@ -1142,6 +1169,7 @@ void HandleConfirmButton(void) {
             if (textBuffer.length > 0) {
                 displayMode = DISPLAY_MODE_EMAIL_SETUP;
                 emailMode = true;
+            emailStatusAutoOpen = false;
                 emailIdx = 0;
                 memset(emailBuffer, 0, sizeof(emailBuffer));
                 displayNeedsUpdate = true;
@@ -1154,6 +1182,7 @@ void HandleConfirmButton(void) {
                 strncpy(emailInfo.recipient, emailBuffer, 63);
                 emailInfo.recipient[63] = '\0';
                 emailMode = false;
+            emailStatusAutoOpen = true;
                 strcpy(emailInfo.status, "Sending...");
                 displayMode = DISPLAY_MODE_EMAIL_STATUS;
                 displayNeedsUpdate = true;
@@ -1174,6 +1203,7 @@ void HandleConfirmButton(void) {
 
         case DISPLAY_MODE_EMAIL_STATUS:
             displayMode = DISPLAY_MODE_HOME;
+          emailStatusAutoOpen = false;
             memset(textBuffer.text, 0, sizeof(textBuffer.text));
             textBuffer.length = 0;
             displayNeedsUpdate = true;
@@ -1194,6 +1224,14 @@ void HandleConfirmButton(void) {
             // Game handles its own input (both menu and gameplay)
             Game_HandleInput(2);
             break;
+
+        case DISPLAY_MODE_SENSORS:
+            // Initialize sensors and enter sensor mode
+            Sensors_Init();
+            Sensors_Start();
+            textBuffer.needsUpdate = true;
+            displayNeedsUpdate = true;
+            break;
     }
 
     xSemaphoreGive(dataMutexHandle);
@@ -1202,7 +1240,11 @@ void HandleConfirmButton(void) {
 
 void HandleUpButton(void) {
     if (xSemaphoreTake(dataMutexHandle, pdMS_TO_TICKS(100)) == pdTRUE) {
-        if (displayMode == DISPLAY_MODE_GAME) {
+        if (sensorMode || displayMode == DISPLAY_MODE_SENSORS) {
+            // In sensor mode - Up button for sensor control
+            Sensors_HandleInput(3); // 3 = Up button
+            displayNeedsUpdate = true;
+        } else if (displayMode == DISPLAY_MODE_GAME) {
       // In game display mode - Up button for game control (menu & gameplay)
       Game_HandleInput(3); // 3 = Up button
         } else {
@@ -1260,7 +1302,11 @@ void HandleUpButton(void) {
 
 void HandleDownButton(void) {
     if (xSemaphoreTake(dataMutexHandle, pdMS_TO_TICKS(100)) == pdTRUE) {
-        if (displayMode == DISPLAY_MODE_GAME) {
+        if (sensorMode || displayMode == DISPLAY_MODE_SENSORS) {
+            // In sensor mode - Down button for sensor control
+            Sensors_HandleInput(4); // 4 = Down button
+            displayNeedsUpdate = true;
+        } else if (displayMode == DISPLAY_MODE_GAME) {
       // In game mode - Down button for game control
       Game_HandleInput(4); // 4 = Down button
         } else {
@@ -1274,22 +1320,43 @@ void HandleDownButton(void) {
                     break;
 
                 case DISPLAY_MODE_TEXT:
-                    // Backspace - remove last character from text buffer
-                    if (textBuffer.length > 0) {
-                        textBuffer.length--;
-                        textBuffer.text[textBuffer.length] = '\0';
-                        displayNeedsUpdate = true;
-                    }
+                  // Backspace if possible, otherwise treat as Exit
+                  if (textBuffer.length > 0) {
+                    textBuffer.length--;
+                    textBuffer.text[textBuffer.length] = '\0';
+                  } else {
+                    emailStatusAutoOpen = false;
+                    emailMode = false;
+                    emailIdx = 0;
+                    memset(emailBuffer, 0, sizeof(emailBuffer));
+                    displayMode = DISPLAY_MODE_HOME;
+                  }
+                  displayNeedsUpdate = true;
                     break;
 
                 case DISPLAY_MODE_EMAIL_SETUP:
-                    // Backspace - remove last character from email
-                    if (emailIdx > 0) {
-                        emailIdx--;
-                        emailBuffer[emailIdx] = '\0';
-                        displayNeedsUpdate = true;
-                    }
+                  // Backspace if possible, otherwise treat as Exit
+                  if (emailIdx > 0) {
+                    emailIdx--;
+                    emailBuffer[emailIdx] = '\0';
+                  } else {
+                    emailStatusAutoOpen = false;
+                    emailMode = false;
+                    emailIdx = 0;
+                    memset(emailBuffer, 0, sizeof(emailBuffer));
+                    // Go back to Text screen (not Home)
+                    displayMode = DISPLAY_MODE_TEXT;
+                  }
+                  displayNeedsUpdate = true;
                     break;
+
+                case DISPLAY_MODE_EMAIL_STATUS:
+                  // Allow dismissing status screen via PC4 as well
+                  emailStatusAutoOpen = false;
+                  emailMode = false;
+                  displayMode = DISPLAY_MODE_HOME;
+                  displayNeedsUpdate = true;
+                  break;
 
                 case DISPLAY_MODE_CALCULATOR:
                     // Backspace in calculator
@@ -1299,7 +1366,6 @@ void HandleDownButton(void) {
 
                 case DISPLAY_MODE_SYSTEM_INFO:
                 case DISPLAY_MODE_SETTINGS:
-                case DISPLAY_MODE_EMAIL_STATUS:
                 case DISPLAY_MODE_GAME:
                     // No action - use PC1 to exit
                     break;
@@ -1467,6 +1533,7 @@ void SendWiFiConfigToESP(void) {
 void DisplayTask(void *argument) {
   DisplayMode_t lastMode = DISPLAY_MODE_HOME;
   bool lastGameMode = false;
+  bool lastSensorMode = false;
 
   // Small delay to let system stabilize
   vTaskDelay(pdMS_TO_TICKS(500));
@@ -1475,6 +1542,7 @@ void DisplayTask(void *argument) {
     bool updateNeeded = false;
     DisplayMode_t currentMode;
     bool currentGameMode;
+    bool currentSensorMode;
 
     // Check if update is needed
     if (xSemaphoreTake(dataMutexHandle, pdMS_TO_TICKS(50)) == pdTRUE) {
@@ -1483,6 +1551,7 @@ void DisplayTask(void *argument) {
       textBuffer.needsUpdate = false;
       currentMode = displayMode;
       currentGameMode = gameMode;  // Get current game mode state
+      currentSensorMode = sensorMode; // Get current sensor mode state
       xSemaphoreGive(dataMutexHandle);
     } else {
       // Couldn't get mutex, try again next cycle
@@ -1493,13 +1562,18 @@ void DisplayTask(void *argument) {
     // Update if:
     // 1. Display mode changed
     // 2. Game mode state changed (entered or exited game)
-    // 3. Normal display update is needed
-    // 4. In game mode, always update for smooth animation
-    // 5. In DISPLAY_MODE_GAME (menu or playing), always update
-    if (currentMode != lastMode || currentGameMode != lastGameMode || updateNeeded || currentGameMode || currentMode == DISPLAY_MODE_GAME) {
+    // 3. Sensor mode state changed (entered or exited sensor)
+    // 4. Normal display update is needed
+    // 5. In game mode, always update for smooth animation
+    // 6. In sensor mode, always update for live readings
+    // 7. In DISPLAY_MODE_GAME or DISPLAY_MODE_SENSORS (menu or active), always update
+    if (currentMode != lastMode || currentGameMode != lastGameMode || currentSensorMode != lastSensorMode || 
+        updateNeeded || currentGameMode || currentSensorMode || 
+        currentMode == DISPLAY_MODE_GAME || currentMode == DISPLAY_MODE_SENSORS) {
       updateNeeded = true;
       lastMode = currentMode;
       lastGameMode = currentGameMode;
+      lastSensorMode = currentSensorMode;
     }
 
     if (updateNeeded) {
@@ -1509,6 +1583,13 @@ void DisplayTask(void *argument) {
           // Game_Render() handles screen clearing internally
           Game_Render();
           SH1106_UpdateScreen();
+          xSemaphoreGive(dataMutexHandle);
+        }
+      } else if (currentSensorMode || currentMode == DISPLAY_MODE_SENSORS) {
+        // Sensor mode - use separate rendering path
+        if (xSemaphoreTake(dataMutexHandle, pdMS_TO_TICKS(200)) == pdTRUE) {
+          Sensors_Update(); // Update sensor readings
+          Sensors_Draw();   // Render sensor display
           xSemaphoreGive(dataMutexHandle);
         }
       } else {
@@ -1558,6 +1639,14 @@ void UpdateDisplay(void) {
       // This case is only reached if gameMode is false (shouldn't happen normally)
       if (!gameMode) {
         Game_Menu_Render();
+      }
+      break;
+    case DISPLAY_MODE_SENSORS:
+      // Sensor rendering is handled when sensorMode is true
+      if (!sensorMode) {
+        // Show sensor menu if not in sensor mode yet
+        SH1106_GotoXY(25, 25);
+        SH1106_Puts("SENSORS", &Font_7x10, 1);
       }
       break;
     case DISPLAY_MODE_SETTINGS:
@@ -1615,8 +1704,12 @@ void UARTReceiveTask(void *argument) {
                 strncpy(emailInfo.status, statusStr, 31);
                 emailInfo.status[31] = '\0';
 
-                if (displayMode != DISPLAY_MODE_EMAIL_STATUS) {
-                  displayMode = DISPLAY_MODE_EMAIL_STATUS;
+                // Only force Email Status screen when user is in the email flow.
+                // This prevents EMAIL status updates from overriding Exit/Home.
+                if (emailStatusAutoOpen || displayMode == DISPLAY_MODE_EMAIL_STATUS || displayMode == DISPLAY_MODE_EMAIL_SETUP) {
+                  if (displayMode != DISPLAY_MODE_EMAIL_STATUS) {
+                    displayMode = DISPLAY_MODE_EMAIL_STATUS;
+                  }
                 }
                 displayNeedsUpdate = true;
 
@@ -1821,36 +1914,37 @@ void DisplayTextScreen(void) {
     SH1106_GotoXY(105, 1);
     SH1106_Puts(countStr, &Font_7x10, 0);
 
-    // Copy text buffer locally
-    char localText[MAX_TEXT_LENGTH];
-    uint16_t localLength;
+    // IMPORTANT: avoid allocating MAX_TEXT_LENGTH on the task stack.
+    // Copy only the visible window (4 lines) into a small local buffer.
+    enum { MAX_DISPLAY_CHARS = DISPLAY_CHARS_PER_LINE * 4 };
+    char localText[MAX_DISPLAY_CHARS + 1];
+    uint16_t localLength = 0;
+    uint16_t startPos = 0;
+    uint16_t copyLen = 0;
 
     if (xSemaphoreTake(dataMutexHandle, pdMS_TO_TICKS(50)) == pdTRUE) {
-        localLength = textBuffer.length;
-        if (localLength > 0) {
-            memcpy(localText, textBuffer.text, localLength);
-            localText[localLength] = '\0';
+      localLength = textBuffer.length;
+      if (localLength > 0) {
+        startPos = (localLength > MAX_DISPLAY_CHARS) ? (localLength - MAX_DISPLAY_CHARS) : 0;
+        copyLen = localLength - startPos;
+        if (copyLen > MAX_DISPLAY_CHARS) {
+          copyLen = MAX_DISPLAY_CHARS;
         }
-        xSemaphoreGive(dataMutexHandle);
-    } else {
-        localLength = 0;
+        memcpy(localText, &textBuffer.text[startPos], copyLen);
+        localText[copyLen] = '\0';
+      }
+      xSemaphoreGive(dataMutexHandle);
     }
 
-    if (localLength > 0) {
-        int maxDisplayChars = DISPLAY_CHARS_PER_LINE * 4;
-        int startPos = 0;
-
-        if (localLength > maxDisplayChars) {
-            startPos = localLength - maxDisplayChars;
-        }
+    if (copyLen > 0) {
 
         char displayLine[DISPLAY_CHARS_PER_LINE + 1];
         int yPos = 14;
         int lineNum = 0;
         int charCount = 0;
 
-        for (int i = startPos; i < localLength && lineNum < 4; i++) {
-            char c = localText[i];
+        for (uint16_t i = 0; i < copyLen && lineNum < 4; i++) {
+          char c = localText[i];
 
             if (c == '\n') {
                 if (charCount > 0) {
@@ -2273,8 +2367,12 @@ void ESP_ReceiveTask(void *argument) {
                 strncpy(emailInfo.status, statusStr, 31);
                 emailInfo.status[31] = '\0';
 
-                if (displayMode != DISPLAY_MODE_EMAIL_STATUS) {
-                  displayMode = DISPLAY_MODE_EMAIL_STATUS;
+                // Only force Email Status screen when user is in the email flow.
+                // This prevents EMAIL status updates from overriding Exit/Home.
+                if (emailStatusAutoOpen || displayMode == DISPLAY_MODE_EMAIL_STATUS || displayMode == DISPLAY_MODE_EMAIL_SETUP) {
+                  if (displayMode != DISPLAY_MODE_EMAIL_STATUS) {
+                    displayMode = DISPLAY_MODE_EMAIL_STATUS;
+                  }
                 }
                 textBuffer.needsUpdate = true;
 
@@ -2583,7 +2681,9 @@ char ConvertHIDKeyToChar(uint8_t keyCode, bool shift) {
 /* USER CODE END Header_StartDefaultTask */
 void StartDefaultTask(void const * argument)
 {
+  /* init code for USB_HOST */
   MX_USB_HOST_Init();
+  /* USER CODE BEGIN 5 */
   SH1106_Init();
 
   // Animated startup using boot animation frames
@@ -2617,25 +2717,58 @@ void StartDefaultTask(void const * argument)
     USBH_Process(&hUsbHostFS);
     osDelay(200);
   }
+  /* USER CODE END 5 */
 }
 
+/**
+  * @brief  Period elapsed callback in non blocking mode
+  * @note   This function is called  when TIM1 interrupt took place, inside
+  * HAL_TIM_IRQHandler(). It makes a direct call to HAL_IncTick() to increment
+  * a global variable "uwTick" used as application time base.
+  * @param  htim : TIM handle
+  * @retval None
+  */
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
+  /* USER CODE BEGIN Callback 0 */
+
+  /* USER CODE END Callback 0 */
   if (htim->Instance == TIM1)
   {
     HAL_IncTick();
   }
+  /* USER CODE BEGIN Callback 1 */
+
+  /* USER CODE END Callback 1 */
 }
 
+/**
+  * @brief  This function is executed in case of error occurrence.
+  * @retval None
+  */
 void Error_Handler(void)
 {
+  /* USER CODE BEGIN Error_Handler_Debug */
+  /* User can add his own implementation to report the HAL error return state */
   __disable_irq();
-  while (1) { }
+  while (1)
+  {
+  }
+  /* USER CODE END Error_Handler_Debug */
 }
-
 #ifdef USE_FULL_ASSERT
+/**
+  * @brief  Reports the name of the source file and the source line number
+  *         where the assert_param error has occurred.
+  * @param  file: pointer to the source file name
+  * @param  line: assert_param error line source number
+  * @retval None
+  */
 void assert_failed(uint8_t *file, uint32_t line)
 {
+  /* USER CODE BEGIN 6 */
+  /* User can add his own implementation to report the file name and line number,
+     ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
+  /* USER CODE END 6 */
 }
-#endif
-
+#endif /* USE_FULL_ASSERT */
