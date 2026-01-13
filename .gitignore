@@ -95,3 +95,4 @@ config_private.h
 # Generated files
 *.autosave
 codeESP8266/codeESP8266.ino
+ post.txt

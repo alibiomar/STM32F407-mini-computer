@@ -3,8 +3,8 @@
 #include <EEPROM.h>  // NEW: For storing WiFi credentials
 
 // WiFi Configuration - Default values
-String ssid = "YOUR_WIFI_SSID";
-String password = "YOUR_WIFI_PASSWORD";
+String ssid = "xxxxxxx";
+String password = "xxxxxxxxxx";
 
 // EEPROM addresses for storing WiFi credentials
 #define EEPROM_SIZE 512
@@ -18,8 +18,8 @@ String password = "YOUR_WIFI_PASSWORD";
 // Gmail SMTP Configuration
 #define SMTP_HOST "smtp.gmail.com"
 #define SMTP_PORT 465
-#define AUTHOR_EMAIL "your-email@gmail.com"
-#define AUTHOR_PASSWORD "your-app-password"
+#define AUTHOR_EMAIL "xxxxxx"
+#define AUTHOR_PASSWORD "xxxxxx"
 
 // SMTP Session
 SMTPSession smtp;

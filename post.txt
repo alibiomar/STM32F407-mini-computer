@@ -1,0 +1,23 @@
+🚀 Excited to share our latest embedded systems project! 🎮
+
+My classmate Abdelkerim El Bani and I just completed a multi-functional desktop system powered by STM32F407 Discovery Board and ESP8266! 
+
+🔧 What we built:
+✅ Real-time sensor integration (ultrasonic distance & IR color detection)
+✅ Retro gaming system (Snake, Pong, Tetris)
+✅ WiFi-enabled email client with USB keyboard support
+✅ FreeRTOS multitasking with 6+ concurrent tasks
+✅ Custom OLED interface with smooth navigation
+
+💡 Key highlights:
+• HC-SR04 ultrasonic sensor for precise distance measurement (2-400 cm)
+• Infrared color sensor for black/white surface detection
+• Full Gmail SMTP integration via ESP8266
+• Thread-safe operations with mutexes and semaphores
+• Advanced GPIO conflict management for shared pins
+
+This project pushed our skills in embedded C, real-time operating systems, I2C/UART communication, and hardware integration. Special thanks to our professors for their guidance! 🙏
+
+Tech Stack: STM32 HAL, FreeRTOS, ESP8266, Arduino, USB Host
+
+#EmbeddedSystems #STM32 #FreeRTOS #IoT #Engineering #Electronics #EmbeddedC #SensorTechnology #ESP8266

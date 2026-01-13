@@ -661,6 +661,10 @@ void ProcessKeyboard(void) {
 
   bool currentShiftState = (keyboardInfo->lshift || keyboardInfo->rshift);
 
+  // Check current modes
+  bool isCalcMode = (displayMode == DISPLAY_MODE_CALCULATOR);
+  bool isSettingsMode = (displayMode == DISPLAY_MODE_SETTINGS);
+
   for (uint8_t i = 0; i < 6; i++) {
     if (keyboardInfo->keys[i] != 0) {
       bool keyFound = false;
@@ -675,11 +679,54 @@ void ProcessKeyboard(void) {
         uint8_t keyCode = keyboardInfo->keys[i];
         char c = 0;
 
+        // ENTER KEY
         if (keyCode == 0x28) {
-          c = '\n';
+          if (isCalcMode) {
+            xSemaphoreGive(dataMutexHandle);
+            CalculatorExecute();
+            memcpy(lastKeyState, keyboardInfo->keys, 6);
+            RequestDisplayUpdate();
+            return;
+          } else if (isSettingsMode) {
+            // Toggle between SSID and Password fields
+            wifiSettings.editingSSID = !wifiSettings.editingSSID;
+            textBuffer.needsUpdate = true;
+            displayNeedsUpdate = true;
+            HAL_GPIO_TogglePin(LED_PORT, LED_BLUE_PIN);
+            xSemaphoreGive(dataMutexHandle);
+            RequestDisplayUpdate();
+            memcpy(lastKeyState, keyboardInfo->keys, 6);
+            return;
+          } else {
+            c = '\n';
+          }
         }
+        // BACKSPACE
         else if (keyCode == 0x2A) {
-          if (emailMode) {
+          if (isCalcMode) {
+            xSemaphoreGive(dataMutexHandle);
+            CalculatorBackspace();
+            memcpy(lastKeyState, keyboardInfo->keys, 6);
+            RequestDisplayUpdate();
+            return;
+          } else if (isSettingsMode) {
+            // Handle backspace for settings
+            if (wifiSettings.editingSSID && wifiSettings.ssidIdx > 0) {
+              wifiSettings.ssidIdx--;
+              wifiSettings.ssid[wifiSettings.ssidIdx] = '\0';
+              textBuffer.needsUpdate = true;
+            } else if (!wifiSettings.editingSSID && wifiSettings.passwordIdx > 0) {
+              wifiSettings.passwordIdx--;
+              wifiSettings.password[wifiSettings.passwordIdx] = '\0';
+              textBuffer.needsUpdate = true;
+            }
+            displayNeedsUpdate = true;
+            HAL_GPIO_TogglePin(LED_PORT, LED_RED_PIN);
+            xSemaphoreGive(dataMutexHandle);
+            RequestDisplayUpdate();
+            memcpy(lastKeyState, keyboardInfo->keys, 6);
+            return;
+          } else if (emailMode) {
             if (emailIdx > 0) {
               emailIdx--;
               emailBuffer[emailIdx] = '\0';
@@ -697,15 +744,44 @@ void ProcessKeyboard(void) {
           memcpy(lastKeyState, keyboardInfo->keys, 6);
           return;
         }
+        // SPACE
         else if (keyCode == 0x2C) {
           c = ' ';
         }
+        // ALL OTHER KEYS
         else {
           c = ConvertHIDKeyToChar(keyCode, currentShiftState);
         }
 
         if (c != 0) {
-          if (emailMode) {
+          if (isCalcMode) {
+            xSemaphoreGive(dataMutexHandle);
+            HandleCalculatorInput(c);
+            memcpy(lastKeyState, keyboardInfo->keys, 6);
+            RequestDisplayUpdate();
+            return;
+          } else if (isSettingsMode) {
+            // Handle settings input directly here to avoid nested mutex
+            if (wifiSettings.editingSSID) {
+              if (wifiSettings.ssidIdx < MAX_SSID_LENGTH) {
+                wifiSettings.ssid[wifiSettings.ssidIdx++] = c;
+                wifiSettings.ssid[wifiSettings.ssidIdx] = '\0';
+                textBuffer.needsUpdate = true;
+              }
+            } else {
+              if (wifiSettings.passwordIdx < MAX_PASSWORD_LENGTH) {
+                wifiSettings.password[wifiSettings.passwordIdx++] = c;
+                wifiSettings.password[wifiSettings.passwordIdx] = '\0';
+                textBuffer.needsUpdate = true;
+              }
+            }
+            displayNeedsUpdate = true;
+            HAL_GPIO_TogglePin(LED_PORT, LED_BLUE_PIN);
+            xSemaphoreGive(dataMutexHandle);
+            RequestDisplayUpdate();
+            memcpy(lastKeyState, keyboardInfo->keys, 6);
+            return;
+          } else if (emailMode) {
             if (emailIdx < 63) {
               emailBuffer[emailIdx++] = c;
             }
@@ -1403,6 +1479,8 @@ void DisplaySettingsScreen(void) {
         editingSSID = wifiSettings.editingSSID;
         ssidLen = wifiSettings.ssidIdx;
         passLen = wifiSettings.passwordIdx;
+
+        // Don't reset flag here - let DisplayTask handle it
         xSemaphoreGive(dataMutexHandle);
     } else {
         strcpy(localSSID, "");
@@ -1472,7 +1550,6 @@ void DisplaySettingsScreen(void) {
         SH1106_Puts(localStatus, &Font_7x10, 1);
     }
 }
-
 // NEW: Handle Settings Input
 void HandleSettingsInput(char c) {
     if (xSemaphoreTake(dataMutexHandle, pdMS_TO_TICKS(100)) == pdTRUE) {
@@ -1494,42 +1571,42 @@ void HandleSettingsInput(char c) {
         xSemaphoreGive(dataMutexHandle);
     }
 }
-
 // NEW: Send WiFi Configuration to ESP
 void SendWiFiConfigToESP(void) {
     char wifiCmd[128];
+    char localSSID[MAX_SSID_LENGTH + 1];
+    char localPassword[MAX_PASSWORD_LENGTH + 1];
     int cmdLen;
 
-    // Send SSID
-    cmdLen = snprintf(wifiCmd, sizeof(wifiCmd), "WIFI_SSID:%s\n", wifiSettings.ssid);
+    // Copy credentials safely
     if (xSemaphoreTake(dataMutexHandle, pdMS_TO_TICKS(100)) == pdTRUE) {
-        HAL_UART_Transmit(&huart6, (uint8_t*)wifiCmd, cmdLen, 1000);
+        strncpy(localSSID, wifiSettings.ssid, MAX_SSID_LENGTH);
+        localSSID[MAX_SSID_LENGTH] = '\0';
+        strncpy(localPassword, wifiSettings.password, MAX_PASSWORD_LENGTH);
+        localPassword[MAX_PASSWORD_LENGTH] = '\0';
         xSemaphoreGive(dataMutexHandle);
+    } else {
+        return; // Failed to get credentials
     }
 
+    // Send SSID (no mutex needed for UART if only one task transmits)
+    cmdLen = snprintf(wifiCmd, sizeof(wifiCmd), "WIFI_SSID:%s\n", localSSID);
+    HAL_UART_Transmit(&huart6, (uint8_t*)wifiCmd, cmdLen, 1000);
     vTaskDelay(pdMS_TO_TICKS(100));
 
     // Send Password
-    cmdLen = snprintf(wifiCmd, sizeof(wifiCmd), "WIFI_PASS:%s\n", wifiSettings.password);
-    if (xSemaphoreTake(dataMutexHandle, pdMS_TO_TICKS(100)) == pdTRUE) {
-        HAL_UART_Transmit(&huart6, (uint8_t*)wifiCmd, cmdLen, 1000);
-        xSemaphoreGive(dataMutexHandle);
-    }
-
+    cmdLen = snprintf(wifiCmd, sizeof(wifiCmd), "WIFI_PASS:%s\n", localPassword);
+    HAL_UART_Transmit(&huart6, (uint8_t*)wifiCmd, cmdLen, 1000);
     vTaskDelay(pdMS_TO_TICKS(100));
 
     // Send connect command
     const char* connectCmd = "WIFI_CONNECT\n";
-    if (xSemaphoreTake(dataMutexHandle, pdMS_TO_TICKS(100)) == pdTRUE) {
-        HAL_UART_Transmit(&huart6, (uint8_t*)connectCmd, strlen(connectCmd), 1000);
-        xSemaphoreGive(dataMutexHandle);
-    }
+    HAL_UART_Transmit(&huart6, (uint8_t*)connectCmd, strlen(connectCmd), 1000);
 
     HAL_GPIO_WritePin(LED_PORT, LED_ORANGE_PIN, GPIO_PIN_SET);
     vTaskDelay(pdMS_TO_TICKS(100));
     HAL_GPIO_WritePin(LED_PORT, LED_ORANGE_PIN, GPIO_PIN_RESET);
 }
-
 void DisplayTask(void *argument) {
   DisplayMode_t lastMode = DISPLAY_MODE_HOME;
   bool lastGameMode = false;
@@ -2245,8 +2322,7 @@ void DisplayEmailStatusScreen(void) {
         SH1106_Puts("FAILED!", &Font_7x10, 1);
     }
     else {
-        // Sending spinner (animated)
-        uint8_t frame = (HAL_GetTick() / 200) % 8;
+
         // Simple rotating line animation
         SH1106_DrawCircle(64, iconY + 6, 8, 1);
 
