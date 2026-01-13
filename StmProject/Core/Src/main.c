@@ -1194,6 +1194,7 @@ void HandleExitButton(void) {
         } else {
             // Exit button - return to home from any screen
       emailStatusAutoOpen = false;
+      ClearTextBuffer();
             if (displayMode != DISPLAY_MODE_HOME) {
                 displayMode = DISPLAY_MODE_HOME;
                 emailMode = false;
@@ -1201,6 +1202,7 @@ void HandleExitButton(void) {
                 memset(emailBuffer, 0, sizeof(emailBuffer));
                 displayNeedsUpdate = true;
             }
+
         }
         xSemaphoreGive(dataMutexHandle);
         RequestDisplayUpdate();
@@ -1282,6 +1284,7 @@ void HandleConfirmButton(void) {
           emailStatusAutoOpen = false;
             memset(textBuffer.text, 0, sizeof(textBuffer.text));
             textBuffer.length = 0;
+            ClearTextBuffer();
             displayNeedsUpdate = true;
             HAL_GPIO_WritePin(LED_PORT, LED_GREEN_PIN, GPIO_PIN_RESET);
             HAL_GPIO_WritePin(LED_PORT, LED_RED_PIN, GPIO_PIN_RESET);
