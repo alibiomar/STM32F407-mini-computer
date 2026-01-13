@@ -1341,6 +1341,7 @@ void HandleUpButton(void) {
                     memset(textBuffer.text, 0, sizeof(textBuffer.text));
                     textBuffer.length = 0;
                     displayNeedsUpdate = true;
+                    ClearTextBuffer();
                     break;
 
                 case DISPLAY_MODE_EMAIL_SETUP:
@@ -1348,12 +1349,14 @@ void HandleUpButton(void) {
                     memset(emailBuffer, 0, sizeof(emailBuffer));
                     emailIdx = 0;
                     displayNeedsUpdate = true;
+                    ClearTextBuffer();
                     break;
 
                 case DISPLAY_MODE_CALCULATOR:
                     // Clear calculator
                     CalculatorClear();
                     displayNeedsUpdate = true;
+                    ClearTextBuffer();
                     break;
 
                 case DISPLAY_MODE_SYSTEM_INFO:
@@ -1365,6 +1368,9 @@ void HandleUpButton(void) {
                     return;
 
                 case DISPLAY_MODE_EMAIL_STATUS:
+                    ClearTextBuffer();
+                    break;
+
                 case DISPLAY_MODE_SETTINGS:
                 case DISPLAY_MODE_GAME:
                     // No secondary action needed
